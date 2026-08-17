@@ -1,6 +1,3 @@
-use image::codecs::jpeg::JpegEncoder;
-use image::ImageEncoder;
-
 use crate::interface::{
     CodecCapabilities, CodecError, CodecFormat, DecodedPixels, EncodeOptions, EncodedOutput,
     ImageCodec, PixelFormat,
@@ -64,27 +61,35 @@ impl ImageCodec for JpegCodec {
 
         let quality = options.quality.clamp(1, 100);
         let mut encoded_bytes = Vec::new();
+        let mut encoder = jpeg_encoder::Encoder::new(&mut encoded_bytes, quality);
+        encoder.set_optimized_huffman_tables(true);
+        if options.effort >= 4 {
+            encoder.set_progressive(true);
+        }
+        if options.effort >= 2 {
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_2_0);
+        } else {
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
+        }
 
         match pixels.pixel_format {
             PixelFormat::Grayscale8 => {
-                let encoder = JpegEncoder::new_with_quality(&mut encoded_bytes, quality);
                 encoder
-                    .write_image(
+                    .encode(
                         &pixels.data,
-                        pixels.width,
-                        pixels.height,
-                        image::ExtendedColorType::L8,
+                        pixels.width as u16,
+                        pixels.height as u16,
+                        jpeg_encoder::ColorType::Luma,
                     )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
             }
             PixelFormat::Rgb8 => {
-                let encoder = JpegEncoder::new_with_quality(&mut encoded_bytes, quality);
                 encoder
-                    .write_image(
+                    .encode(
                         &pixels.data,
-                        pixels.width,
-                        pixels.height,
-                        image::ExtendedColorType::Rgb8,
+                        pixels.width as u16,
+                        pixels.height as u16,
+                        jpeg_encoder::ColorType::Rgb,
                     )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
             }
@@ -106,13 +111,12 @@ impl ImageCodec for JpegCodec {
                     rgb_data.push(out_b);
                 }
 
-                let encoder = JpegEncoder::new_with_quality(&mut encoded_bytes, quality);
                 encoder
-                    .write_image(
+                    .encode(
                         &rgb_data,
-                        pixels.width,
-                        pixels.height,
-                        image::ExtendedColorType::Rgb8,
+                        pixels.width as u16,
+                        pixels.height as u16,
+                        jpeg_encoder::ColorType::Rgb,
                     )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
             }
@@ -126,13 +130,12 @@ impl ImageCodec for JpegCodec {
                     gray_data.push(out_l);
                 }
 
-                let encoder = JpegEncoder::new_with_quality(&mut encoded_bytes, quality);
                 encoder
-                    .write_image(
+                    .encode(
                         &gray_data,
-                        pixels.width,
-                        pixels.height,
-                        image::ExtendedColorType::L8,
+                        pixels.width as u16,
+                        pixels.height as u16,
+                        jpeg_encoder::ColorType::Luma,
                     )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
             }

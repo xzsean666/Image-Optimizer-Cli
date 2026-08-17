@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::OptimizationConfig;
+use crate::config::{OptimizationConfig, OutputFormatPolicy};
 use crate::error::Result;
 use crate::executor::BatchOptions;
 use crate::hash::{hash_bytes, Sha256Digest};
@@ -203,31 +203,30 @@ impl SyncService {
             total_original += file_bytes.len() as u64;
 
             // Target format projection for key computation
-            let expected_format = match config.output_format_policy {
-                crate::config::OutputFormatPolicy::Force(fmt) => fmt,
-                crate::config::OutputFormatPolicy::AllowWebp => ImageFormat::Webp,
-                crate::config::OutputFormatPolicy::PreserveOriginal => {
-                    match crate::detect::detect_format(&file_bytes) {
-                        Ok(fmt) => fmt,
-                        Err(e) => {
-                            failed_count += 1;
-                            let err_msg = format!("format detection failed: {e}");
-                            manifest.record_failure(&path_str, Some(&sha_str), &err_msg);
-                            items.push(SyncItemResult {
-                                path: discovered.path.clone(),
-                                source_sha256: Some(source_sha),
-                                status: SyncItemStatus::Failed,
-                                source_bytes: file_bytes.len() as u64,
-                                optimized_bytes: None,
-                                format: None,
-                                quality_score: None,
-                                remote_url: None,
-                                error: Some(err_msg),
-                            });
-                            continue;
-                        }
-                    }
+            let detected_fmt = match crate::detect::detect_format(&file_bytes) {
+                Ok(fmt) => fmt,
+                Err(e) => {
+                    failed_count += 1;
+                    let err_msg = format!("format detection failed: {e}");
+                    manifest.record_failure(&path_str, Some(&sha_str), &err_msg);
+                    items.push(SyncItemResult {
+                        path: discovered.path.clone(),
+                        source_sha256: Some(source_sha),
+                        status: SyncItemStatus::Failed,
+                        source_bytes: file_bytes.len() as u64,
+                        optimized_bytes: None,
+                        format: None,
+                        quality_score: None,
+                        remote_url: None,
+                        error: Some(err_msg),
+                    });
+                    continue;
                 }
+            };
+
+            let expected_format = match config.output_format_policy {
+                OutputFormatPolicy::Force(fmt) => fmt,
+                _ => detected_fmt,
             };
 
             let opt_key = OptimizationKey::compute(
@@ -238,7 +237,22 @@ impl SyncService {
             );
 
             // Deduplication and resume decision
-            let action = manifest.evaluate(&sha_str, opt_key.as_str());
+            let mut action = manifest.evaluate(&sha_str, opt_key.as_str());
+            if config.output_format_policy == OutputFormatPolicy::AllowWebp
+                && expected_format != ImageFormat::Webp
+                && !matches!(action, SyncPlanAction::SkipUpToDate { .. })
+            {
+                let opt_key_webp = OptimizationKey::compute(
+                    &source_sha,
+                    self.optimizer.optimizer_version(),
+                    ImageFormat::Webp,
+                    config,
+                );
+                let webp_action = manifest.evaluate(&sha_str, opt_key_webp.as_str());
+                if matches!(webp_action, SyncPlanAction::SkipUpToDate { .. }) {
+                    action = webp_action;
+                }
+            }
 
             match action {
                 SyncPlanAction::SkipUpToDate {

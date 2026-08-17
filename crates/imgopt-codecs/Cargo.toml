@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 image = { workspace = true }
 webp = { workspace = true }
+oxipng = { workspace = true }
+jpeg-encoder = { workspace = true }
+
+
 
 [dev-dependencies]
 tempfile = { workspace = true }

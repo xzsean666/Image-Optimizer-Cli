@@ -48,6 +48,47 @@ pub struct SearchResult {
     pub diagnostics: SearchDiagnostics,
 }
 
+fn evaluate_single_candidate(
+    decoded_input: &DecodedPixels,
+    raw_image: &RawImage,
+    codec: &dyn ImageCodec,
+    target_format: ImageFormat,
+    enc_opt: &EncodeOptions,
+) -> Option<OptimizationCandidate> {
+    let desc = if enc_opt.lossless {
+        format!("{}-lossless-eff{}", target_format, enc_opt.effort)
+    } else {
+        format!(
+            "{}-q{}-eff{}",
+            target_format, enc_opt.quality, enc_opt.effort
+        )
+    };
+
+    let encoded = codec.encode(decoded_input, enc_opt).ok()?;
+    let decoded_cand = codec.decode(&encoded.bytes).ok()?;
+
+    let width = raw_image.dimensions.width as usize;
+    let height = raw_image.dimensions.height as usize;
+    let channels = raw_image.color_type.channels() as usize;
+
+    let cand_data = if decoded_cand.data.len() == raw_image.data.len() {
+        decoded_cand.data
+    } else {
+        return None;
+    };
+
+    let quality_score =
+        compute_quality_score(&raw_image.data, &cand_data, width, height, channels).ok()?;
+
+    Some(OptimizationCandidate::new(
+        target_format,
+        encoded.bytes,
+        quality_score.ssim,
+        Some(quality_score.psnr),
+        desc,
+    ))
+}
+
 /// Search for the smallest candidate meeting the quality criteria using the provided codec.
 pub fn search_best_candidate(
     raw_image: &RawImage,
@@ -57,102 +98,103 @@ pub fn search_best_candidate(
     let caps = codec.capabilities();
     let decoded_input: DecodedPixels = raw_image.clone().into();
 
-    let mut candidate_configs: Vec<EncodeOptions> = Vec::new();
+    let mut evaluated_candidates = Vec::new();
 
     // If lossless is requested and supported, evaluate lossless option
     if options.try_lossless && caps.supports_lossless {
-        candidate_configs.push(EncodeOptions {
+        let lossless_opt = EncodeOptions {
             quality: 100,
             effort: options.effort,
             lossless: true,
             preserve_metadata: false,
-        });
-    }
-
-    // If lossy is supported, evaluate discrete quality steps
-    if caps.supports_lossy {
-        let step = options.quality_step.max(1);
-        let mut q = options.quality_min.clamp(1, 100);
-        let q_max = options.quality_max.clamp(q, 100);
-
-        while q <= q_max {
-            candidate_configs.push(EncodeOptions {
-                quality: q,
-                effort: options.effort,
-                lossless: false,
-                preserve_metadata: false,
-            });
-            if q == q_max {
-                break;
-            }
-            q = (q + step).min(q_max);
+        };
+        if let Some(cand) = evaluate_single_candidate(
+            &decoded_input,
+            raw_image,
+            codec,
+            options.target_format,
+            &lossless_opt,
+        ) {
+            evaluated_candidates.push(cand);
         }
     }
 
-    if candidate_configs.is_empty() {
+    if caps.supports_lossy {
+        if options.quality_step > 1 {
+            // Linear step mode for coarser scans
+            let step = options.quality_step;
+            let mut q = options.quality_min.clamp(1, 100);
+            let q_max = options.quality_max.clamp(q, 100);
+
+            while q <= q_max {
+                let enc_opt = EncodeOptions {
+                    quality: q,
+                    effort: options.effort,
+                    lossless: false,
+                    preserve_metadata: false,
+                };
+                if let Some(cand) = evaluate_single_candidate(
+                    &decoded_input,
+                    raw_image,
+                    codec,
+                    options.target_format,
+                    &enc_opt,
+                ) {
+                    evaluated_candidates.push(cand);
+                }
+                if q == q_max {
+                    break;
+                }
+                q = (q + step).min(q_max);
+            }
+        } else {
+            // High-precision binary search (Bisection) mode for exact rate-distortion optimization
+            let mut low = options.quality_min.clamp(1, 100);
+            let mut high = options.quality_max.clamp(low, 100);
+
+            while low <= high {
+                let mid = low + (high - low) / 2;
+                let enc_opt = EncodeOptions {
+                    quality: mid,
+                    effort: options.effort,
+                    lossless: false,
+                    preserve_metadata: false,
+                };
+
+                if let Some(cand) = evaluate_single_candidate(
+                    &decoded_input,
+                    raw_image,
+                    codec,
+                    options.target_format,
+                    &enc_opt,
+                ) {
+                    let ssim = cand.quality_score;
+                    evaluated_candidates.push(cand);
+
+                    if ssim >= options.quality_target {
+                        // Quality threshold satisfied; try lower qualities to find smaller size
+                        if mid == low {
+                            break;
+                        }
+                        high = mid - 1;
+                    } else {
+                        // Quality threshold not satisfied; must increase quality
+                        low = mid + 1;
+                    }
+                } else {
+                    low = mid + 1;
+                }
+            }
+        }
+    }
+
+    if evaluated_candidates.is_empty() {
         return Err(ImgoptError::new(
             PipelineStage::CandidateGeneration,
             ErrorKind::Configuration(format!(
                 "no viable encoding modes supported for format {}",
                 options.target_format
             )),
-        ));
-    }
-
-    let mut evaluated_candidates = Vec::with_capacity(candidate_configs.len());
-
-    for enc_opt in candidate_configs {
-        let desc = if enc_opt.lossless {
-            format!("{}-lossless-eff{}", options.target_format, enc_opt.effort)
-        } else {
-            format!(
-                "{}-q{}-eff{}",
-                options.target_format, enc_opt.quality, enc_opt.effort
-            )
-        };
-
-        let encoded = match codec.encode(&decoded_input, &enc_opt) {
-            Ok(enc) => enc,
-            Err(_) => {
-                // If a single candidate encode fails, log and continue to allow other candidates
-                continue;
-            }
-        };
-
-        // Decode back to raw pixels to measure perceptual loss against source
-        let decoded_cand = match codec.decode(&encoded.bytes) {
-            Ok(dec) => dec,
-            Err(_) => continue,
-        };
-
-        // Calculate quality score against original raw image
-        let width = raw_image.dimensions.width as usize;
-        let height = raw_image.dimensions.height as usize;
-        let channels = raw_image.color_type.channels() as usize;
-
-        // Ensure decoded candidate matches channels of original
-        let cand_data = if decoded_cand.data.len() == raw_image.data.len() {
-            decoded_cand.data
-        } else {
-            // Channel layout adjustment if needed
-            decoded_cand.data
-        };
-
-        let quality_score = if cand_data.len() == raw_image.data.len() {
-            match compute_quality_score(&raw_image.data, &cand_data, width, height, channels) {
-                Ok(score) => score,
-                Err(_) => continue,
-            }
-        } else {
-            continue;
-        };
-
-        evaluated_candidates.push(OptimizationCandidate::new(
-            options.target_format,
-            encoded.bytes,
-            quality_score.ssim,
-            Some(quality_score.psnr),
-            desc,
         ));
     }
 
@@ -241,5 +283,26 @@ mod tests {
                                                            // Smallest bytes (q70 -> size 700) should be chosen
         assert_eq!(result.selected.byte_size, 700);
         assert_eq!(result.selected.parameters_description, "webp-q70-eff4");
+    }
+
+    #[test]
+    fn test_search_binary_search_finds_minimum_quality() {
+        let raw = RawImage::new(Dimensions::new(4, 4), ColorType::Rgb8, vec![100; 48]);
+        let codec = TestCodec;
+        let options = SearchOptions {
+            target_format: ImageFormat::Webp,
+            quality_target: 0.90,
+            effort: 4,
+            quality_min: 50,
+            quality_max: 100,
+            quality_step: 1, // trigger binary search
+            try_lossless: false,
+            max_allowed_bytes: None,
+        };
+
+        let result = search_best_candidate(&raw, &codec, &options).unwrap();
+        // Since all candidates return perfect quality in TestCodec, binary search will search down to 50
+        assert_eq!(result.selected.byte_size, 500);
+        assert_eq!(result.selected.parameters_description, "webp-q50-eff4");
     }
 }

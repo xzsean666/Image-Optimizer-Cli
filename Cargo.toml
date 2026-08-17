@@ -26,3 +26,7 @@ tempfile = "3.17"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
 url = "2.5"
 webp = "0.3"
+oxipng = "10.2"
+jpeg-encoder = "0.7"
+
+

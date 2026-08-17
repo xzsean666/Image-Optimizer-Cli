@@ -76,6 +76,16 @@ impl ImageCodec for PngCodec {
             .write_image(&pixels.data, pixels.width, pixels.height, color_type)
             .map_err(|e| CodecError::EncodeError(format!("PNG encode error: {e}")))?;
 
+        // Apply OxiPNG lossless compression optimization
+        let opt_level = options.effort.clamp(1, 6);
+        let mut oxipng_opts = oxipng::Options::from_preset(opt_level);
+        oxipng_opts.fix_errors = true;
+        if let Ok(optimized) = oxipng::optimize_from_memory(&encoded_bytes, &oxipng_opts) {
+            if optimized.len() < encoded_bytes.len() {
+                encoded_bytes = optimized;
+            }
+        }
+
         Ok(EncodedOutput {
             format: CodecFormat::Png,
             bytes: encoded_bytes,

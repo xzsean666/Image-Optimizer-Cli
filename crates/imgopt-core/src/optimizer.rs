@@ -108,14 +108,14 @@ impl OptimizationService {
 
             let try_lossless = match target_fmt {
                 ImageFormat::Png => true,
-                ImageFormat::Webp => config.preset == OptimizationPreset::Maximum,
+                ImageFormat::Webp => true,
                 ImageFormat::Jpeg => false,
             };
 
             let (q_min, q_max, q_step) = match config.preset {
-                OptimizationPreset::Maximum => (85, 98, 4),
-                OptimizationPreset::Balanced => (70, 90, 5),
-                OptimizationPreset::Aggressive => (55, 80, 5),
+                OptimizationPreset::Maximum => (70, 98, 1),
+                OptimizationPreset::Balanced => (45, 95, 1),
+                OptimizationPreset::Aggressive => (30, 88, 1),
             };
 
             let search_opts = SearchOptions {
