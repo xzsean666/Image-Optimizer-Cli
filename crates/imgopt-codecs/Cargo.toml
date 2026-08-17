@@ -1,0 +1,12 @@
+[package]
+name = "imgopt-codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { workspace = true }
+webp = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

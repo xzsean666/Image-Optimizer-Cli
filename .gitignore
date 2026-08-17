@@ -1,0 +1,9 @@
+/target/
+/.cargo/
+.env
+.env.*
+.imgopt/
+*.log
+result.json
+benchmark-results.json
+.DS_Store
