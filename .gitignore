@@ -7,3 +7,7 @@
 result.json
 benchmark-results.json
 .DS_Store
+*.tar.gz
+*.zip
+*.sha256
+
