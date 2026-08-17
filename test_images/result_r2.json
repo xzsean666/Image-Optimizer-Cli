@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "summary": {
+    "total_files": 4,
+    "optimized_files": 4,
+    "skipped_files": 0,
+    "failed_files": 0,
+    "original_bytes": 187903,
+    "optimized_bytes": 101324,
+    "saved_bytes": 86579,
+    "saved_ratio": 0.4607643305322427,
+    "elapsed_millis": 9639
+  },
+  "items": [
+    {
+      "path": "test_images/dog.jpeg",
+      "status": "optimized",
+      "source_sha256": "2fb93417a742dd406f20915822e07e6a011f5377cf97f5a91b555fdd3e215c58",
+      "source_bytes": 171405,
+      "optimized_bytes": 94386,
+      "format": "webp",
+      "quality_score": 0.9693503138884508,
+      "remote_url": "https://pub-e0f43eb5c0df47b191df40a8db804550.r2.dev/test-demo/images/2fb93417a742dd406f20915822e07e6a011f5377cf97f5a91b555fdd3e215c58/optimized.webp"
+    },
+    {
+      "path": "test_images/sample_graphic.png",
+      "status": "optimized",
+      "source_sha256": "b09b517420963fa89b7c851838e13f5aeb106937c5f3d3148e28d7dab0d7935d",
+      "source_bytes": 2697,
+      "optimized_bytes": 2684,
+      "format": "png",
+      "quality_score": 1.0,
+      "remote_url": "https://pub-e0f43eb5c0df47b191df40a8db804550.r2.dev/test-demo/images/b09b517420963fa89b7c851838e13f5aeb106937c5f3d3148e28d7dab0d7935d/optimized.png"
+    },
+    {
+      "path": "test_images/sample_grid.webp",
+      "status": "optimized",
+      "source_sha256": "da341164c4d3e6f3c45b381e6942b396e9a378380ff96ced99146e2b62f25c83",
+      "source_bytes": 3032,
+      "optimized_bytes": 1894,
+      "format": "webp",
+      "quality_score": 0.9780096063400817,
+      "remote_url": "https://pub-e0f43eb5c0df47b191df40a8db804550.r2.dev/test-demo/images/da341164c4d3e6f3c45b381e6942b396e9a378380ff96ced99146e2b62f25c83/optimized.webp"
+    },
+    {
+      "path": "test_images/sample_photo.jpg",
+      "status": "optimized",
+      "source_sha256": "36fc642c0d21794117f830ce802551cdd5730b486bf0e46770b50f351ff76ea4",
+      "source_bytes": 10769,
+      "optimized_bytes": 2360,
+      "format": "webp",
+      "quality_score": 0.9542957167085744,
+      "remote_url": "https://pub-e0f43eb5c0df47b191df40a8db804550.r2.dev/test-demo/images/36fc642c0d21794117f830ce802551cdd5730b486bf0e46770b50f351ff76ea4/optimized.webp"
+    }
+  ]
+}

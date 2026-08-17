@@ -12,6 +12,7 @@ pub struct S3StorageConfig {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub force_path_style: bool,
+    pub key_prefix: Option<String>,
     pub public_url_base: Option<String>,
     pub timeout_seconds: u64,
 }
@@ -25,6 +26,7 @@ impl fmt::Debug for S3StorageConfig {
             .field("access_key_id", &"***REDACTED***")
             .field("secret_access_key", &"***REDACTED***")
             .field("force_path_style", &self.force_path_style)
+            .field("key_prefix", &self.key_prefix)
             .field("public_url_base", &self.public_url_base)
             .field("timeout_seconds", &self.timeout_seconds)
             .finish()
@@ -35,11 +37,12 @@ impl Default for S3StorageConfig {
     fn default() -> Self {
         Self {
             bucket: String::new(),
-            region: "auto".to_string(),
+            region: "us-east-1".to_string(),
             endpoint: None,
             access_key_id: String::new(),
             secret_access_key: String::new(),
-            force_path_style: false,
+            force_path_style: true,
+            key_prefix: None,
             public_url_base: None,
             timeout_seconds: 30,
         }
@@ -75,7 +78,8 @@ impl S3StorageConfig {
 
         let region = env::var("IMGOPT_S3_REGION")
             .or_else(|_| env::var("AWS_REGION"))
-            .unwrap_or_else(|_| "auto".into());
+            .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".into());
 
         let endpoint = env::var("IMGOPT_S3_ENDPOINT")
             .or_else(|_| env::var("AWS_ENDPOINT_URL"))
@@ -84,7 +88,12 @@ impl S3StorageConfig {
 
         let force_path_style = env::var("IMGOPT_S3_FORCE_PATH_STYLE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or(true);
+
+        let key_prefix = env::var("IMGOPT_S3_KEY_PREFIX")
+            .or_else(|_| env::var("IMGOPT_S3_PREFIX"))
+            .ok()
+            .filter(|s| !s.is_empty());
 
         let public_url_base = env::var("IMGOPT_PUBLIC_URL_BASE")
             .ok()
@@ -102,6 +111,7 @@ impl S3StorageConfig {
             access_key_id,
             secret_access_key,
             force_path_style,
+            key_prefix,
             public_url_base,
             timeout_seconds,
         };
@@ -149,6 +159,7 @@ mod tests {
             access_key_id: "key123".into(),
             secret_access_key: "secret456".into(),
             force_path_style: false,
+            key_prefix: Some("custom/prefix".into()),
             public_url_base: Some("https://cdn.example.com".into()),
             timeout_seconds: 30,
         };

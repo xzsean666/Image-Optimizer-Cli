@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "optimizer_version": "0.1.0",
+  "created_at": "1970-01-01T00:00:00Z",
+  "updated_at": "1970-01-01T00:00:00Z",
+  "entries": {
+    "2fb93417a742dd406f20915822e07e6a011f5377cf97f5a91b555fdd3e215c58": {
+      "source": {
+        "sha256": "2fb93417a742dd406f20915822e07e6a011f5377cf97f5a91b555fdd3e215c58",
+        "format": "jpeg",
+        "byte_size": 171405,
+        "dimensions": {
+          "width": 1024,
+          "height": 559
+        }
+      },
+      "optimization": {
+        "optimization_key": "opt-v1-webp-balanced-a83a677454f4103d8857f26732c9327925696f4e03730efb6e73d2dc53ca0c5c",
+        "output_format": "webp",
+        "output_size": 94386,
+        "quality_score": 0.9693503138884508,
+        "preset": "balanced",
+        "completed_at": "2026-08-17T00:00:00Z"
+      },
+      "storage": {
+        "bucket": "sean-server-hk-p",
+        "object_key": "test-demo/images/2fb93417a742dd406f20915822e07e6a011f5377cf97f5a91b555fdd3e215c58/optimized.webp",
+        "etag": "d45e931bbb45b0c472f3d4389a93a915",
+        "public_url": "https://hk-s3.002788.xyz:9001/sean-server-hk-p/test-demo/images/2fb93417a742dd406f20915822e07e6a011f5377cf97f5a91b555fdd3e215c58/optimized.webp?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=hkp_s3_94a792aa792d%2F20260817%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260817T035444Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=b00598413f183944626e999c0ffa165bd596dd6eda05870a1d076a232dee32b9",
+        "uploaded_at": "2026-08-17T00:00:00Z",
+        "verified": true
+      },
+      "status": "uploaded",
+      "known_paths": [
+        "test_images/dog.jpeg"
+      ]
+    },
+    "36fc642c0d21794117f830ce802551cdd5730b486bf0e46770b50f351ff76ea4": {
+      "source": {
+        "sha256": "36fc642c0d21794117f830ce802551cdd5730b486bf0e46770b50f351ff76ea4",
+        "format": "jpeg",
+        "byte_size": 10769,
+        "dimensions": {
+          "width": 256,
+          "height": 256
+        }
+      },
+      "optimization": {
+        "optimization_key": "opt-v1-webp-maximum-d3954c2f01b8b378632f022f485b02d4808adba650d480ed86ea99715b2de1ea",
+        "output_format": "webp",
+        "output_size": 4322,
+        "quality_score": 0.9734209812164848,
+        "preset": "maximum",
+        "completed_at": "2026-08-17T00:00:00Z"
+      },
+      "storage": {
+        "bucket": "sean-server-hk-p",
+        "object_key": "test-demo/images/36fc642c0d21794117f830ce802551cdd5730b486bf0e46770b50f351ff76ea4/optimized.webp",
+        "etag": "de2f7061f7debc7704d8ba2277eb2721",
+        "public_url": "https://hk-s3.002788.xyz:9001/sean-server-hk-p/test-demo/images/36fc642c0d21794117f830ce802551cdd5730b486bf0e46770b50f351ff76ea4/optimized.webp?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=hkp_s3_94a792aa792d%2F20260817%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260817T034834Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=43f05e97f15c178472435d3dd8f135713d219201be0b33e198e16aad0556d233",
+        "uploaded_at": "2026-08-17T00:00:00Z",
+        "verified": true
+      },
+      "status": "uploaded",
+      "known_paths": [
+        "test_images/sample_photo.jpg"
+      ]
+    },
+    "b09b517420963fa89b7c851838e13f5aeb106937c5f3d3148e28d7dab0d7935d": {
+      "source": {
+        "sha256": "b09b517420963fa89b7c851838e13f5aeb106937c5f3d3148e28d7dab0d7935d",
+        "format": "png",
+        "byte_size": 2697,
+        "dimensions": {
+          "width": 256,
+          "height": 256
+        }
+      },
+      "optimization": {
+        "optimization_key": "opt-v1-webp-maximum-8307291152240c1abb906f072f34c06c991574df6857bc8e09cca78855c19a4c",
+        "output_format": "webp",
+        "output_size": 888,
+        "quality_score": 1.0,
+        "preset": "maximum",
+        "completed_at": "2026-08-17T00:00:00Z"
+      },
+      "storage": {
+        "bucket": "sean-server-hk-p",
+        "object_key": "test-demo/images/b09b517420963fa89b7c851838e13f5aeb106937c5f3d3148e28d7dab0d7935d/optimized.webp",
+        "etag": "4976ea866398d8bd4b16242ed7651ff0",
+        "public_url": "https://hk-s3.002788.xyz:9001/sean-server-hk-p/test-demo/images/b09b517420963fa89b7c851838e13f5aeb106937c5f3d3148e28d7dab0d7935d/optimized.webp?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=hkp_s3_94a792aa792d%2F20260817%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260817T034829Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=00c1153ede8af6d2836ecfc0120f6f73b816b88135b9cc4ecb3dd7164732793c",
+        "uploaded_at": "2026-08-17T00:00:00Z",
+        "verified": true
+      },
+      "status": "uploaded",
+      "known_paths": [
+        "test_images/sample_graphic.png"
+      ]
+    },
+    "da341164c4d3e6f3c45b381e6942b396e9a378380ff96ced99146e2b62f25c83": {
+      "source": {
+        "sha256": "da341164c4d3e6f3c45b381e6942b396e9a378380ff96ced99146e2b62f25c83",
+        "format": "webp",
+        "byte_size": 3032,
+        "dimensions": {
+          "width": 256,
+          "height": 256
+        }
+      },
+      "optimization": {
+        "optimization_key": "opt-v1-webp-maximum-564055ec332c0b5a7771a09ecaf1f6d43f4ff4a96598bc817253c3aa6c3f9ad1",
+        "output_format": "webp",
+        "output_size": 2970,
+        "quality_score": 0.9910526093719212,
+        "preset": "maximum",
+        "completed_at": "2026-08-17T00:00:00Z"
+      },
+      "storage": {
+        "bucket": "sean-server-hk-p",
+        "object_key": "test-demo/images/da341164c4d3e6f3c45b381e6942b396e9a378380ff96ced99146e2b62f25c83/optimized.webp",
+        "etag": "8f9c1d130ad236dc388401cc47a80d8d",
+        "public_url": "https://hk-s3.002788.xyz:9001/sean-server-hk-p/test-demo/images/da341164c4d3e6f3c45b381e6942b396e9a378380ff96ced99146e2b62f25c83/optimized.webp?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=hkp_s3_94a792aa792d%2F20260817%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260817T034832Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=efeca746caf3ae07b05cc074c07106fc6ca7e73d53ca9a43728dc73f3d657168",
+        "uploaded_at": "2026-08-17T00:00:00Z",
+        "verified": true
+      },
+      "status": "uploaded",
+      "known_paths": [
+        "test_images/sample_grid.webp"
+      ]
+    }
+  }
+}

@@ -19,8 +19,54 @@ use imgopt_storage::{
 #[derive(Parser, Debug)]
 #[command(name = "imgopt", version, about = "Image Optimizer CLI")]
 struct Cli {
+    /// Path to custom environment variable file (.env)
+    #[arg(global = true, long = "env-file")]
+    env_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+fn load_dotenv_file(path: &Path) {
+    if let Ok(content) = fs::read_to_string(path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim().trim_matches('"').trim_matches('\'');
+                std::env::set_var(key, val);
+            }
+        }
+    }
+}
+
+fn parse_env_file_arg() -> Option<PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--env-file" && i + 1 < args.len() {
+            return Some(PathBuf::from(&args[i + 1]));
+        }
+        if let Some(val) = args[i].strip_prefix("--env-file=") {
+            return Some(PathBuf::from(val));
+        }
+    }
+    None
+}
+
+fn main() -> ExitCode {
+    let env_path = parse_env_file_arg().unwrap_or_else(|| PathBuf::from(".env"));
+    load_dotenv_file(&env_path);
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -104,6 +150,10 @@ struct SyncArgs {
     #[arg(long)]
     endpoint: Option<String>,
 
+    /// Override S3 key prefix
+    #[arg(long)]
+    prefix: Option<String>,
+
     /// Override public URL base
     #[arg(long)]
     public_url_base: Option<String>,
@@ -183,17 +233,6 @@ struct BenchmarkArgs {
     /// Path to write machine-readable benchmark JSON report
     #[arg(long)]
     json: Option<PathBuf>,
-}
-
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("Error: {err}");
-            ExitCode::FAILURE
-        }
-    }
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -390,6 +429,7 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
             storage,
             args.public_url_base
                 .or_else(|| Some("https://dry-run.local".into())),
+            args.prefix,
             RetryPolicy::default(),
         );
         let sync_service = SyncService::new(version, batch_options, &bucket);
@@ -407,11 +447,12 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref b) = args.bucket {
                     S3StorageConfig {
                         bucket: b.clone(),
-                        region: "auto".into(),
+                        region: "us-east-1".into(),
                         endpoint: args.endpoint.clone(),
                         access_key_id: "anonymous".into(),
                         secret_access_key: "anonymous".into(),
-                        force_path_style: false,
+                        force_path_style: true,
+                        key_prefix: args.prefix.clone(),
                         public_url_base: args.public_url_base.clone(),
                         timeout_seconds: 30,
                     }
@@ -427,15 +468,40 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ep) = args.endpoint {
             s3_config.endpoint = Some(ep);
         }
+        if let Some(pref) = args.prefix {
+            s3_config.key_prefix = Some(pref);
+        }
         if let Some(purl) = args.public_url_base {
             s3_config.public_url_base = Some(purl);
         }
 
+        // If public_url_base is not set, derive from endpoint and bucket
+        let public_url_base = s3_config.public_url_base.clone().or_else(|| {
+            s3_config.endpoint.as_ref().map(|ep| {
+                let clean_ep = ep.trim_end_matches('/');
+                if s3_config.force_path_style {
+                    format!("{clean_ep}/{}", s3_config.bucket)
+                } else {
+                    clean_ep.to_string()
+                }
+            })
+        });
+
         let bucket = s3_config.bucket.clone();
-        let public_url_base = s3_config.public_url_base.clone();
+        let key_prefix = s3_config.key_prefix.clone();
         let s3_client = S3Client::new(s3_config)?;
-        let storage_adapter =
-            StorageSyncAdapter::new(s3_client, public_url_base, RetryPolicy::default());
+        let s3_client_for_presign = s3_client.clone();
+        let storage_adapter = StorageSyncAdapter::new(
+            s3_client,
+            public_url_base,
+            key_prefix,
+            RetryPolicy::default(),
+        )
+        .with_presigned_generator(move |bucket, object_key| {
+            s3_client_for_presign
+                .generate_presigned_url(bucket, object_key, 604800)
+                .ok()
+        });
         let sync_service = SyncService::new(version, batch_options, &bucket);
         sync_service.run_sync(
             &args.input,
@@ -479,6 +545,8 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
     for item in &sync_result.items {
         if let Some(ref err) = item.error {
             eprintln!("  - {}: {}", item.path.display(), err);
+        } else if let Some(ref url) = item.remote_url {
+            println!("  + {}: {}", item.path.display(), url);
         }
     }
     println!("  Original bytes:  {}", sync_result.original_bytes);
@@ -611,11 +679,12 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(_) => S3StorageConfig {
                         bucket: bucket.clone(),
-                        region: "auto".into(),
+                        region: "us-east-1".into(),
                         endpoint: None,
                         access_key_id: "anonymous".into(),
                         secret_access_key: "anonymous".into(),
-                        force_path_style: false,
+                        force_path_style: true,
+                        key_prefix: None,
                         public_url_base: None,
                         timeout_seconds: 30,
                     },

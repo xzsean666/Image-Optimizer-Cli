@@ -38,6 +38,27 @@ pub fn derive_object_key(source_sha256: &str, format: &str) -> Result<String, St
     Ok(format!("images/{clean_sha}/optimized.{clean_fmt}"))
 }
 
+/// Derive a deterministic object key with an optional prefix directory path.
+pub fn derive_object_key_with_prefix(
+    prefix: Option<&str>,
+    source_sha256: &str,
+    format: &str,
+) -> Result<String, StorageError> {
+    let base_key = derive_object_key(source_sha256, format)?;
+    if let Some(p) = prefix {
+        let clean_p = p.trim().trim_matches('/');
+        if !clean_p.is_empty() {
+            if clean_p.contains("..") {
+                return Err(StorageError::InvalidParameter(
+                    "key prefix cannot contain path traversal sequences ('..')".into(),
+                ));
+            }
+            return Ok(format!("{clean_p}/{base_key}"));
+        }
+    }
+    Ok(base_key)
+}
+
 /// Construct a safe public URL given a public base URL and an object key.
 pub fn build_public_url(public_url_base: &str, object_key: &str) -> Result<String, StorageError> {
     let base = public_url_base.trim();
@@ -81,6 +102,13 @@ mod tests {
         let key2 = derive_object_key("A1B2C3D4E5", "WEBP").unwrap();
         assert_eq!(key1, "images/a1b2c3d4e5/optimized.webp");
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_derive_object_key_with_prefix() {
+        let key =
+            derive_object_key_with_prefix(Some("my-prefix/uploads"), "a1b2c3d4e5", "webp").unwrap();
+        assert_eq!(key, "my-prefix/uploads/images/a1b2c3d4e5/optimized.webp");
     }
 
     #[test]

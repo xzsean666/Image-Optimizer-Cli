@@ -4,22 +4,42 @@ use imgopt_core::{
 
 use crate::interface::{ObjectStorage, UploadRequest};
 use crate::upload::{upload_and_verify, RetryPolicy};
-use crate::url::{build_public_url, derive_object_key};
+use crate::url::{build_public_url, derive_object_key_with_prefix};
+
+/// Type alias for dynamic presigned URL generator functions.
+pub type PresignedUrlGenerator = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
 /// Adapter connecting any ObjectStorage implementation to the SyncStorage pipeline contract.
 pub struct StorageSyncAdapter<S: ObjectStorage> {
     pub storage: S,
     pub public_url_base: Option<String>,
+    pub key_prefix: Option<String>,
+    pub presigned_url_generator: Option<PresignedUrlGenerator>,
     pub retry_policy: RetryPolicy,
 }
 
 impl<S: ObjectStorage> StorageSyncAdapter<S> {
-    pub fn new(storage: S, public_url_base: Option<String>, retry_policy: RetryPolicy) -> Self {
+    pub fn new(
+        storage: S,
+        public_url_base: Option<String>,
+        key_prefix: Option<String>,
+        retry_policy: RetryPolicy,
+    ) -> Self {
         Self {
             storage,
             public_url_base,
+            key_prefix,
+            presigned_url_generator: None,
             retry_policy,
         }
+    }
+
+    pub fn with_presigned_generator<F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static>(
+        mut self,
+        gen: F,
+    ) -> Self {
+        self.presigned_url_generator = Some(Box::new(gen));
+        self
     }
 }
 
@@ -44,10 +64,13 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
             )
         })?;
 
-        let public_url = self
-            .public_url_base
-            .as_ref()
-            .and_then(|base| build_public_url(base, object_key).ok());
+        let public_url = if let Some(ref base) = self.public_url_base {
+            build_public_url(base, object_key).ok()
+        } else if let Some(ref gen) = self.presigned_url_generator {
+            gen(bucket, object_key)
+        } else {
+            None
+        };
 
         Ok(SyncStorageOutput {
             bucket: res.bucket,
@@ -60,7 +83,12 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
     }
 
     fn derive_object_key(&self, source_sha256: &str, format: ImageFormat) -> CoreResult<String> {
-        derive_object_key(source_sha256, format.extension()).map_err(|e| {
+        derive_object_key_with_prefix(
+            self.key_prefix.as_deref(),
+            source_sha256,
+            format.extension(),
+        )
+        .map_err(|e| {
             ImgoptError::new(
                 PipelineStage::StorageUpload,
                 imgopt_core::ErrorKind::InvalidInput(e.to_string()),
@@ -69,8 +97,12 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
     }
 
     fn build_public_url(&self, object_key: &str) -> Option<String> {
-        self.public_url_base
-            .as_ref()
-            .and_then(|base| build_public_url(base, object_key).ok())
+        if let Some(ref gen) = self.presigned_url_generator {
+            gen("", object_key)
+        } else {
+            self.public_url_base
+                .as_ref()
+                .and_then(|base| build_public_url(base, object_key).ok())
+        }
     }
 }
