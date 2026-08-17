@@ -26,19 +26,31 @@ crates/imgopt-cli        Command-line interface and binary entry point (`imgopt`
 
 ---
 
-## Installation & Build
+## Documentation
 
-### Prerequisites
-- Rust 1.80.0+ (`rustup toolchain install stable`)
-- Cargo
+- 📖 **[中文用户使用手册 (User Guide)](docs/USER_GUIDE.md)**: 包含完整命令指南、参数参考、实战场景与常见问题解答。
+- 🏗️ **[Architecture Specification](docs/ARCHITECTURE.md)**: 系统架构与模块设计。
+- ⚙️ **[Technical Specification](docs/SPEC.md)**: 算法细节与技术规范。
 
-### Building from Source
+---
+
+## Installation
+
+### Option 1: Download Pre-built Binary (Recommended)
+Download the standalone executable directly from [GitHub Releases](https://github.com/xzsean666/Image-Optimizer-Cli/releases):
+
+- **Linux**: `imgopt-linux-x86_64.tar.gz` / `imgopt-linux-aarch64.tar.gz`
+- **macOS**: `imgopt-macos-aarch64.tar.gz` (Apple Silicon) / `imgopt-macos-x86_64.tar.gz` (Intel)
+- **Windows**: `imgopt-windows-x86_64.zip`
+
+### Option 2: Build from Source
 ```bash
 git clone https://github.com/xzsean666/Image-Optimizer-Cli.git
 cd Image-Optimizer-Cli
 cargo build --release
 ```
 The compiled binary will be located at `target/release/imgopt`.
+
 
 ---
 
