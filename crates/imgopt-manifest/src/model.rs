@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use imgopt_core::{Dimensions, ImageFormat};
+use imgopt_core::{utc_now_rfc3339, Dimensions, ImageFormat};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
@@ -72,7 +72,7 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn new(optimizer_version: impl Into<String>) -> Self {
-        let now = "1970-01-01T00:00:00Z".to_string();
+        let now = utc_now_rfc3339();
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             optimizer_version: optimizer_version.into(),
@@ -96,6 +96,10 @@ impl Manifest {
         }
     }
 
+    pub fn touch(&mut self) {
+        self.updated_at = utc_now_rfc3339();
+    }
+
     pub fn get(&self, source_sha256: &str) -> Option<&ManifestEntry> {
         self.entries.get(source_sha256)
     }
@@ -104,8 +108,16 @@ impl Manifest {
         self.entries.get_mut(source_sha256)
     }
 
-    pub fn insert(&mut self, entry: ManifestEntry) {
+    pub fn insert(&mut self, mut entry: ManifestEntry) {
+        if let Some(existing) = self.entries.get(&entry.source.sha256) {
+            for p in &existing.known_paths {
+                if !entry.known_paths.contains(p) {
+                    entry.known_paths.push(p.clone());
+                }
+            }
+        }
         self.entries.insert(entry.source.sha256.clone(), entry);
+        self.touch();
     }
 
     pub fn add_path_alias(&mut self, source_sha256: &str, path: impl Into<String>) {
@@ -113,6 +125,7 @@ impl Manifest {
             let p = path.into();
             if !entry.known_paths.contains(&p) {
                 entry.known_paths.push(p);
+                self.touch();
             }
         }
     }
@@ -187,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_path_alias_deduplication() {
+    fn test_path_alias_deduplication_and_merge_on_insert() {
         let mut manifest = Manifest::new("0.1.0");
         let hash = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string();
 
@@ -205,9 +218,26 @@ mod tests {
         });
 
         manifest.add_path_alias(&hash, "dir2/copy.png");
-        manifest.add_path_alias(&hash, "dir1/img.png"); // duplicate path should not be re-added
+        manifest.add_path_alias(&hash, "dir1/img.png");
+
+        // Re-inserting with a new path preserves prior known_paths
+        manifest.insert(ManifestEntry {
+            source: ManifestSourceRecord {
+                sha256: hash.clone(),
+                format: ImageFormat::Png,
+                byte_size: 2048,
+                dimensions: Dimensions::new(100, 100),
+            },
+            optimization: None,
+            storage: None,
+            status: EntryStatus::Uploaded,
+            known_paths: vec!["dir3/renamed.png".into()],
+        });
 
         let entry = manifest.get(&hash).unwrap();
-        assert_eq!(entry.known_paths, vec!["dir1/img.png", "dir2/copy.png"]);
+        assert_eq!(
+            entry.known_paths,
+            vec!["dir3/renamed.png", "dir1/img.png", "dir2/copy.png"]
+        );
     }
 }

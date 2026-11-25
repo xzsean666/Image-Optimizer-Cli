@@ -25,13 +25,18 @@ This document records the architectural and technical design decisions made duri
 
 ---
 
-## ADR-003: Pure-Rust & Embedded Native Codecs
+## ADR-003: Embedded Codecs and Native Acceleration Libraries
 
-- **Context**: External CLI tools (like cwebp, jpegoptim, oxipng binaries) or system daemons complicate deployment and cross-platform reproducibility.
-- **Decision**: Embed native codec adapters using the pure-Rust `image` crate (for JPEG / PNG) and `webp` crate (for WebP lossy and lossless encoding).
+- **Context**: External CLI tools (like `cwebp`, `jpegoptim`, `oxipng` binaries) or system daemons complicate deployment and cross-platform reproducibility.
+- **Decision**: Embed native codec bindings directly in `imgopt-codecs`:
+  - **Decoding**: `image` crate (`zune-jpeg`, `png`, `image-webp`) with pre-allocation `DecodeLimits` (`max_width`, `max_height`, `max_pixels`, `max_alloc_bytes`) and automatic EXIF orientation normalization.
+  - **JPEG Encoding**: `jpeg-encoder` (`0.7`) with optimized Huffman tables, progressive scans, 4:2:0/4:4:4 chroma subsampling, and explicit ICC/EXIF/XMP embedding when requested.
+  - **PNG Encoding**: `image` `PngEncoder` paired with `oxipng` (`10.2`, linking `libdeflate-sys` C library via `cc`) for lossless filter/DEFLATE optimization and explicit chunk stripping/preservation.
+  - **WebP Encoding**: `webp` (`0.3`, linking `libwebp-sys` C library via `cc`) using `WebPConfig` (`method` mapped from `effort`, lossy/lossless) and RIFF `VP8X` chunk muxing when metadata preservation is enabled.
 - **Consequences**:
-  - Zero external system dependencies.
-  - Memory-safe decode and encode execution with predictable error typing.
+  - Zero runtime dependency on external CLI binaries.
+  - Requires a standard C toolchain (`cc`) at build time for `libwebp-sys` and `libdeflate-sys` (`oxipng`), which is handled by the GitHub Actions CI/Release environments.
+  - Consistent typed error mapping (`CodecError`) and bounded decode safeguards before large pixel allocations.
 
 ---
 

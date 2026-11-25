@@ -53,4 +53,15 @@ fn test_inspect_human_and_json() {
     // Verify no side-effect files were created in temp dir
     let entries: Vec<_> = fs::read_dir(temp.path()).unwrap().collect();
     assert_eq!(entries.len(), 1);
+
+    // Directory JSON mode must produce a valid JSON array
+    let dir_out = Command::new(bin_path)
+        .args(["inspect", temp.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(dir_out.status.success());
+    let dir_json: serde_json::Value =
+        serde_json::from_slice(&dir_out.stdout).expect("directory --json must be valid JSON");
+    assert!(dir_json.is_array());
+    assert_eq!(dir_json.as_array().unwrap().len(), 1);
 }

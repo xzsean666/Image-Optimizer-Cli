@@ -1,9 +1,23 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::model::{Manifest, CURRENT_SCHEMA_VERSION};
 use imgopt_core::{ErrorKind, ImgoptError, PipelineStage, Result};
+
+/// Advisory exclusive OS file lock guarding concurrent multi-process manifest updates.
+/// Automatically released by the OS kernel when dropped or if the process terminates.
+#[derive(Debug)]
+pub struct ManifestLock {
+    _file: File,
+    path: PathBuf,
+}
+
+impl ManifestLock {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 /// Storage manager for loading and atomically persisting manifest files.
 #[derive(Debug, Clone)]
@@ -18,6 +32,75 @@ impl ManifestStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn lock_file_path(&self) -> PathBuf {
+        let mut os_name = self.path.as_os_str().to_os_string();
+        os_name.push(".lock");
+        PathBuf::from(os_name)
+    }
+
+    fn open_lock_file(&self) -> Result<(File, PathBuf)> {
+        let parent_dir = match self.path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        if !parent_dir.exists() {
+            fs::create_dir_all(parent_dir).map_err(|e| {
+                ImgoptError::new(
+                    PipelineStage::ManifestLookup,
+                    ErrorKind::Io(format!("failed to create manifest directory: {e}")),
+                )
+                .with_path(parent_dir)
+            })?;
+        }
+        let lock_path = self.lock_file_path();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                ImgoptError::new(
+                    PipelineStage::ManifestLookup,
+                    ErrorKind::Io(format!("failed to open manifest lock file: {e}")),
+                )
+                .with_path(&lock_path)
+            })?;
+        Ok((file, lock_path))
+    }
+
+    /// Acquire a blocking exclusive cross-process lock for this manifest.
+    pub fn acquire_lock(&self) -> Result<ManifestLock> {
+        let (file, lock_path) = self.open_lock_file()?;
+        file.lock().map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::ManifestLookup,
+                ErrorKind::Io(format!("failed to acquire manifest lock: {e}")),
+            )
+            .with_path(&lock_path)
+        })?;
+        Ok(ManifestLock {
+            _file: file,
+            path: lock_path,
+        })
+    }
+
+    /// Try to acquire an exclusive cross-process lock without blocking.
+    pub fn try_acquire_lock(&self) -> Result<ManifestLock> {
+        let (file, lock_path) = self.open_lock_file()?;
+        file.try_lock().map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::ManifestLookup,
+                ErrorKind::Persistence(format!("manifest is locked by another process: {e}")),
+            )
+            .with_path(&lock_path)
+        })?;
+        Ok(ManifestLock {
+            _file: file,
+            path: lock_path,
+        })
     }
 
     /// Load an existing manifest, or return a new empty manifest if the file does not exist.
@@ -68,7 +151,7 @@ impl ManifestStore {
         Ok(manifest)
     }
 
-    /// Atomically save the manifest using write-to-temp-then-rename semantics.
+    /// Atomically save the manifest using exclusive temporary file + fsync + rename.
     pub fn save(&self, manifest: &Manifest) -> Result<()> {
         if manifest.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(ImgoptError::new(
@@ -81,7 +164,10 @@ impl ManifestStore {
             .with_path(&self.path));
         }
 
-        let parent_dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let parent_dir = match self.path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
         if !parent_dir.exists() {
             fs::create_dir_all(parent_dir).map_err(|e| {
                 ImgoptError::new(
@@ -102,58 +188,46 @@ impl ManifestStore {
             .with_path(&self.path)
         })?;
 
-        // Write to temporary file in the same directory to ensure atomic same-filesystem rename
-        let tmp_path = parent_dir.join(format!(
-            ".manifest-{}.tmp",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-
-        let write_res = (|| -> Result<()> {
-            let mut tmp_file = File::create(&tmp_path).map_err(|e| {
+        let mut tmp_file = tempfile::Builder::new()
+            .prefix(".manifest-")
+            .suffix(".tmp")
+            .tempfile_in(parent_dir)
+            .map_err(|e| {
                 ImgoptError::new(
                     PipelineStage::ManifestCommit,
                     ErrorKind::Io(format!("failed to create temporary manifest file: {e}")),
                 )
-                .with_path(&tmp_path)
+                .with_path(parent_dir)
             })?;
 
-            tmp_file.write_all(&json_bytes).map_err(|e| {
-                ImgoptError::new(
-                    PipelineStage::ManifestCommit,
-                    ErrorKind::Io(format!("failed to write temporary manifest file: {e}")),
-                )
-                .with_path(&tmp_path)
-            })?;
+        tmp_file.write_all(&json_bytes).map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::ManifestCommit,
+                ErrorKind::Io(format!("failed to write temporary manifest file: {e}")),
+            )
+            .with_path(tmp_file.path())
+        })?;
 
-            tmp_file.sync_all().map_err(|e| {
-                ImgoptError::new(
-                    PipelineStage::ManifestCommit,
-                    ErrorKind::Io(format!("failed to sync temporary manifest file: {e}")),
-                )
-                .with_path(&tmp_path)
-            })?;
+        tmp_file.as_file().sync_all().map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::ManifestCommit,
+                ErrorKind::Io(format!("failed to sync temporary manifest file: {e}")),
+            )
+            .with_path(tmp_file.path())
+        })?;
 
-            fs::rename(&tmp_path, &self.path).map_err(|e| {
-                ImgoptError::new(
-                    PipelineStage::ManifestCommit,
-                    ErrorKind::Io(format!(
-                        "failed to rename temporary manifest file to target: {e}"
-                    )),
-                )
-                .with_path(&self.path)
-            })?;
+        tmp_file.persist(&self.path).map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::ManifestCommit,
+                ErrorKind::Io(format!(
+                    "failed to persist temporary manifest file to target: {}",
+                    e.error
+                )),
+            )
+            .with_path(&self.path)
+        })?;
 
-            Ok(())
-        })();
-
-        if write_res.is_err() && tmp_path.exists() {
-            let _ = fs::remove_file(&tmp_path);
-        }
-
-        write_res
+        Ok(())
     }
 }
 
@@ -172,7 +246,6 @@ mod tests {
         assert_eq!(manifest.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(manifest.optimizer_version, "0.1.0");
         assert_eq!(manifest.entries.len(), 0);
-        // Ensure file was not created on read-only load_or_init
         assert!(!path.exists());
     }
 
@@ -208,6 +281,20 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_exclusive_lock_blocks_second_holder() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("manifest.json");
+        let store1 = ManifestStore::new(&path);
+        let store2 = ManifestStore::new(&path);
+
+        let guard = store1.try_acquire_lock().unwrap();
+        assert!(store2.try_acquire_lock().is_err());
+
+        drop(guard);
+        assert!(store2.try_acquire_lock().is_ok());
+    }
+
+    #[test]
     fn test_malformed_json_leaves_file_intact() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("broken.json");
@@ -218,7 +305,6 @@ mod tests {
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().stage, PipelineStage::ManifestLookup);
 
-        // Verify original broken content remains untouched
         assert_eq!(fs::read(&path).unwrap(), b"not valid json {{{");
     }
 }

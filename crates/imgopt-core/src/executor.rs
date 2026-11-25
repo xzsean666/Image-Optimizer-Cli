@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
 
@@ -61,16 +61,16 @@ impl<I> BatchTask<I> {
     }
 }
 
-/// Execute a batch of tasks across a bounded worker pool with per-item failure isolation.
-pub fn execute_batch<I, T, F>(
+/// Execute a batch of tasks across a bounded scoped worker pool without requiring `'static`.
+pub fn execute_batch_scoped<I, T, F>(
     tasks: Vec<BatchTask<I>>,
     options: &BatchOptions,
     worker: F,
 ) -> (Vec<BatchItemResult<T>>, BatchSummary)
 where
-    I: Send + 'static,
-    T: Send + 'static,
-    F: Fn(PathBuf, I) -> Result<T, ImgoptError> + Sync + Send + 'static,
+    I: Send,
+    T: Send,
+    F: Fn(PathBuf, I) -> Result<T, ImgoptError> + Sync,
 {
     let start_time = Instant::now();
     let total = tasks.len();
@@ -88,86 +88,65 @@ where
     }
 
     let concurrency = options.concurrency.max(1).min(total);
-    let worker_fn = Arc::new(worker);
-
     let indexed_tasks: VecDeque<(usize, BatchTask<I>)> = tasks.into_iter().enumerate().collect();
-    let queue = Arc::new(Mutex::new(indexed_tasks));
-    let has_error = Arc::new(Mutex::new(false));
-
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    let mut worker_handles = Vec::with_capacity(concurrency);
-
-    for _ in 0..concurrency {
-        let q_clone = Arc::clone(&queue);
-        let fn_clone = Arc::clone(&worker_fn);
-        let tx_clone = tx.clone();
-        let err_flag = Arc::clone(&has_error);
-        let stop_on_err = options.stop_on_error;
-
-        let handle = thread::spawn(move || loop {
-            if stop_on_err {
-                if let Ok(err) = err_flag.lock() {
-                    if *err {
-                        break;
-                    }
-                }
-            }
-
-            let next_item = {
-                let mut guard = match q_clone.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.pop_front()
-            };
-
-            let (index, task) = match next_item {
-                Some(item) => item,
-                None => break,
-            };
-
-            let path = task.path.clone();
-            let result = fn_clone(task.path, task.data);
-
-            if result.is_err() && stop_on_err {
-                if let Ok(mut err) = err_flag.lock() {
-                    *err = true;
-                }
-            }
-
-            let item_res = BatchItemResult {
-                index,
-                source_path: path,
-                output: result,
-            };
-
-            let _ = tx_clone.send(item_res);
-        });
-
-        worker_handles.push(handle);
-    }
-
-    drop(tx); // Drop initial sender so rx closes when all workers finish
+    let queue = Mutex::new(indexed_tasks);
+    let has_error = AtomicBool::new(false);
+    let stop_on_err = options.stop_on_error;
+    let worker_ref = &worker;
 
     let mut results = Vec::with_capacity(total);
-    let mut succeeded = 0;
-    let mut failed = 0;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
 
-    for item in rx {
-        if item.output.is_ok() {
-            succeeded += 1;
-        } else {
-            failed += 1;
+    thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..concurrency {
+            let tx_clone = tx.clone();
+            let queue_ref = &queue;
+            let err_ref = &has_error;
+            scope.spawn(move || loop {
+                if stop_on_err && err_ref.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let next_item = {
+                    let mut guard = match queue_ref.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.pop_front()
+                };
+
+                let Some((index, task)) = next_item else {
+                    break;
+                };
+
+                let path = task.path.clone();
+                let result = worker_ref(task.path, task.data);
+
+                if result.is_err() && stop_on_err {
+                    err_ref.store(true, Ordering::Release);
+                }
+
+                let _ = tx_clone.send(BatchItemResult {
+                    index,
+                    source_path: path,
+                    output: result,
+                });
+            });
         }
-        results.push(item);
-    }
+        drop(tx);
 
-    for handle in worker_handles {
-        let _ = handle.join();
-    }
+        for item in rx {
+            if item.output.is_ok() {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+            results.push(item);
+        }
+    });
 
-    // Sort results to match original submitted task ordering
     results.sort_by_key(|r| r.index);
 
     let elapsed_millis = start_time.elapsed().as_millis() as u64;
@@ -181,6 +160,20 @@ where
             elapsed_millis,
         },
     )
+}
+
+/// Execute a batch of tasks across a bounded worker pool with per-item failure isolation.
+pub fn execute_batch<I, T, F>(
+    tasks: Vec<BatchTask<I>>,
+    options: &BatchOptions,
+    worker: F,
+) -> (Vec<BatchItemResult<T>>, BatchSummary)
+where
+    I: Send + 'static,
+    T: Send + 'static,
+    F: Fn(PathBuf, I) -> Result<T, ImgoptError> + Sync + Send + 'static,
+{
+    execute_batch_scoped(tasks, options, worker)
 }
 
 /// Test probe helper to track peak concurrent active worker threads.
@@ -222,6 +215,7 @@ impl ConcurrencyProbe {
 mod tests {
     use super::*;
     use crate::error::{ErrorKind, PipelineStage};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]

@@ -121,8 +121,9 @@ imgopt optimize <INPUT> [OPTIONS]
 | `--preset <PRESET>` | — | `balanced` | 优化预设：`balanced`, `maximum`, `aggressive` |
 | `--quality <F64>` | `-q` | 预设默认 | 显式指定目标 SSIM 画质分数（`0.0` 至 `1.0`，例如 `0.95`） |
 | `--effort <U8>` | `-e` | 预设默认 | 编码耗力级别（`1` 至 `6`，数值越大压缩率越高、耗时越长） |
-| `--format <POLICY>` | — | `preserve` | 格式策略：`preserve`（保持原格式）、`webp`（优先转 WebP） |
+| `--format <POLICY>` | — | `preserve` | 格式策略：`preserve`（保持原格式）、`webp`（优先转 WebP）、`jpeg`、`png` |
 | `--preserve-metadata`| — | `false` | 是否保留 EXIF / ICC / XMP 元数据（默认剔除以最大化瘦身） |
+| `--concurrency <N>` | — | CPU 核数 | 最大并发处理线程数 |
 
 ---
 

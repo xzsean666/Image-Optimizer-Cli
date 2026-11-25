@@ -1,5 +1,6 @@
 use imgopt_core::{
-    ImageFormat, ImgoptError, PipelineStage, Result as CoreResult, SyncStorage, SyncStorageOutput,
+    utc_now_rfc3339, ImageFormat, ImgoptError, PipelineStage, Result as CoreResult, SyncStorage,
+    SyncStorageOutput,
 };
 
 use crate::interface::{ObjectStorage, UploadRequest};
@@ -78,7 +79,7 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
             byte_size: res.byte_size,
             etag: res.etag,
             public_url,
-            uploaded_at: "2026-08-17T00:00:00Z".to_string(),
+            uploaded_at: utc_now_rfc3339(),
         })
     }
 
@@ -97,12 +98,12 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
     }
 
     fn build_public_url(&self, object_key: &str) -> Option<String> {
-        if let Some(ref gen) = self.presigned_url_generator {
+        if let Some(ref base) = self.public_url_base {
+            build_public_url(base, object_key).ok()
+        } else if let Some(ref gen) = self.presigned_url_generator {
             gen("", object_key)
         } else {
-            self.public_url_base
-                .as_ref()
-                .and_then(|base| build_public_url(base, object_key).ok())
+            None
         }
     }
 }

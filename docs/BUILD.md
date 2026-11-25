@@ -4,7 +4,7 @@ This document describes how to build, test, and verify the `Image-Optimizer-Cli`
 
 ## System Prerequisites
 
-- **Rust**: Version `1.80.0` or newer (managed via `rust-toolchain.toml` or `rustup`).
+- **Rust**: Version `1.89.0` or newer (managed via `rust-toolchain.toml` or `rustup`).
 - **Cargo**: Bundled with standard Rust distributions.
 - **Git**: For version control.
 

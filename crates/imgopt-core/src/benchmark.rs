@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -6,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::OptimizationConfig;
 use crate::error::Result;
+use crate::executor::{execute_batch_scoped, BatchOptions, BatchTask};
 use crate::model::ImageFormat;
 use crate::optimizer::OptimizationService;
 use crate::scanner::{scan_path, ScanOptions};
@@ -54,6 +54,16 @@ impl BenchmarkReport {
 
 /// Run optimization benchmark across all supported images in a dataset directory or file.
 pub fn run_benchmark(dataset_path: &Path, config: &OptimizationConfig) -> Result<BenchmarkReport> {
+    let default_concurrency = BatchOptions::default().concurrency;
+    run_benchmark_with_concurrency(dataset_path, config, default_concurrency)
+}
+
+/// Run optimization benchmark using bounded concurrency.
+pub fn run_benchmark_with_concurrency(
+    dataset_path: &Path,
+    config: &OptimizationConfig,
+    concurrency: usize,
+) -> Result<BenchmarkReport> {
     let start_time = Instant::now();
     config.validate()?;
 
@@ -61,75 +71,76 @@ pub fn run_benchmark(dataset_path: &Path, config: &OptimizationConfig) -> Result
     let service = OptimizationService::new(version);
 
     let scan_res = scan_path(dataset_path, &ScanOptions::default())?;
+    let tasks: Vec<BatchTask<u64>> = scan_res
+        .files
+        .iter()
+        .map(|f| BatchTask::new(&f.path, f.byte_size))
+        .collect();
 
-    let mut cases = Vec::with_capacity(scan_res.files.len());
-    let mut total_original = 0u64;
-    let mut total_optimized = 0u64;
-    let mut success_count = 0usize;
-    let mut fail_count = 0usize;
-    let mut sum_quality = 0.0f64;
+    let batch_opts = BatchOptions {
+        concurrency: concurrency.max(1),
+        stop_on_error: false,
+    };
 
-    for discovered in &scan_res.files {
+    let (batch_results, _) = execute_batch_scoped(tasks, &batch_opts, |path, expected_bytes| {
         let case_start = Instant::now();
-        let file_bytes = match fs::read(&discovered.path) {
-            Ok(b) => b,
+        match service.optimize_file(&path, config) {
+            Ok(opt_res) => Ok(BenchmarkCaseResult {
+                path,
+                format: Some(opt_res.effective_format),
+                original_bytes: opt_res.validated_output.original_size,
+                optimized_bytes: Some(opt_res.validated_output.byte_size),
+                savings_ratio: Some(opt_res.validated_output.savings_ratio),
+                quality_score: Some(opt_res.quality_score),
+                psnr_score: opt_res.psnr_score,
+                elapsed_millis: case_start.elapsed().as_millis() as u64,
+                error: None,
+            }),
             Err(e) => {
-                fail_count += 1;
-                cases.push(BenchmarkCaseResult {
-                    path: discovered.path.clone(),
+                let actual_size = std::fs::metadata(&path)
+                    .map(|m| m.len())
+                    .unwrap_or(expected_bytes);
+                Ok(BenchmarkCaseResult {
+                    path,
                     format: None,
-                    original_bytes: discovered.byte_size,
-                    optimized_bytes: None,
-                    savings_ratio: None,
-                    quality_score: None,
-                    psnr_score: None,
-                    elapsed_millis: case_start.elapsed().as_millis() as u64,
-                    error: Some(format!("failed to read file: {e}")),
-                });
-                continue;
-            }
-        };
-
-        let orig_size = file_bytes.len() as u64;
-        total_original += orig_size;
-
-        match service.optimize_bytes(&file_bytes, config) {
-            Ok(opt_res) => {
-                let opt_size = opt_res.validated_output.byte_size;
-                total_optimized += opt_size;
-                success_count += 1;
-                sum_quality += opt_res.quality_score;
-
-                cases.push(BenchmarkCaseResult {
-                    path: discovered.path.clone(),
-                    format: Some(opt_res.effective_format),
-                    original_bytes: orig_size,
-                    optimized_bytes: Some(opt_size),
-                    savings_ratio: Some(opt_res.validated_output.savings_ratio),
-                    quality_score: Some(opt_res.quality_score),
-                    psnr_score: opt_res.psnr_score,
-                    elapsed_millis: case_start.elapsed().as_millis() as u64,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                fail_count += 1;
-                cases.push(BenchmarkCaseResult {
-                    path: discovered.path.clone(),
-                    format: None,
-                    original_bytes: orig_size,
+                    original_bytes: actual_size,
                     optimized_bytes: None,
                     savings_ratio: None,
                     quality_score: None,
                     psnr_score: None,
                     elapsed_millis: case_start.elapsed().as_millis() as u64,
                     error: Some(e.to_string()),
-                });
+                })
             }
+        }
+    });
+
+    let mut cases = Vec::with_capacity(batch_results.len());
+    let mut total_original = 0u64;
+    let mut total_optimized = 0u64;
+    let mut success_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut sum_quality = 0.0f64;
+
+    for res in batch_results {
+        if let Ok(case) = res.output {
+            total_original += case.original_bytes;
+            if let (Some(opt_size), Some(q)) = (case.optimized_bytes, case.quality_score) {
+                total_optimized += opt_size;
+                success_count += 1;
+                sum_quality += q;
+            } else {
+                fail_count += 1;
+            }
+            cases.push(case);
         }
     }
 
-    let total_saved = (total_original as i64) - (total_optimized as i64);
+    let total_saved = if total_original >= total_optimized {
+        i64::try_from(total_original - total_optimized).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(total_optimized - total_original).unwrap_or(i64::MAX)
+    };
     let overall_ratio = if total_original > 0 && total_saved > 0 {
         total_saved as f64 / total_original as f64
     } else {
@@ -143,7 +154,7 @@ pub fn run_benchmark(dataset_path: &Path, config: &OptimizationConfig) -> Result
     };
 
     let summary = BenchmarkSummary {
-        total_cases: scan_res.files.len(),
+        total_cases: cases.len(),
         successful_cases: success_count,
         failed_cases: fail_count,
         total_original_bytes: total_original,
@@ -166,6 +177,7 @@ mod tests {
     use super::*;
     use crate::config::OptimizationPreset;
     use imgopt_codecs::ImageCodec;
+    use std::fs;
     use tempfile::TempDir;
 
     fn make_test_png(path: &Path) {

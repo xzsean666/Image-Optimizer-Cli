@@ -1,8 +1,53 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{ErrorKind, ImgoptError, PipelineStage, Result};
+
+/// Break a Unix timestamp (seconds since epoch) into `(year, month, day, hour, minute, second)` UTC.
+pub fn unix_to_utc_components(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = (rem / 3600) as u32;
+    let minute = ((rem % 3600) / 60) as u32;
+    let second = (rem % 60) as u32;
+
+    let mut y = 1970i64;
+    let mut d = days;
+    loop {
+        let leap = i64::from((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0));
+        let days_in_year = 365 + leap;
+        if d < days_in_year {
+            break;
+        }
+        d -= days_in_year;
+        y += 1;
+    }
+
+    let leap = i64::from((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0));
+    let month_days = [31, 28 + leap, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 1u32;
+    for &md in &month_days {
+        if d < md {
+            break;
+        }
+        d -= md;
+        m += 1;
+    }
+    let day = (d + 1) as u32;
+    (y, m, day, hour, minute, second)
+}
+
+/// Format current system UTC time as RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn utc_now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, m, d, hour, minute, second) = unix_to_utc_components(secs);
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
 
 /// Supported image formats for Image Optimizer V1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -173,6 +218,12 @@ pub struct ImageMetadata {
     pub has_xmp: bool,
 }
 
+impl ImageMetadata {
+    pub const fn has_any(&self) -> bool {
+        self.has_exif || self.has_icc || self.has_xmp
+    }
+}
+
 /// Profile and characteristics of an image file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageProfile {
@@ -189,6 +240,7 @@ pub struct RawImage {
     pub dimensions: Dimensions,
     pub color_type: ColorType,
     pub data: Vec<u8>,
+    pub metadata: imgopt_codecs::ImageMetadataChunks,
 }
 
 impl RawImage {
@@ -197,17 +249,24 @@ impl RawImage {
             dimensions,
             color_type,
             data,
+            metadata: imgopt_codecs::ImageMetadataChunks::default(),
         }
     }
 
     pub fn expected_byte_len(&self) -> usize {
         (self.dimensions.width as usize)
-            * (self.dimensions.height as usize)
-            * self.color_type.bytes_per_pixel()
+            .saturating_mul(self.dimensions.height as usize)
+            .saturating_mul(self.color_type.bytes_per_pixel())
     }
 
     pub fn is_valid(&self) -> bool {
-        self.data.len() == self.expected_byte_len()
+        let Some(expected) = (self.dimensions.width as usize)
+            .checked_mul(self.dimensions.height as usize)
+            .and_then(|px| px.checked_mul(self.color_type.bytes_per_pixel()))
+        else {
+            return false;
+        };
+        self.data.len() == expected
     }
 }
 
@@ -303,18 +362,20 @@ impl From<imgopt_codecs::DecodedPixels> for RawImage {
             dimensions: Dimensions::new(d.width, d.height),
             color_type: d.pixel_format.into(),
             data: d.data,
+            metadata: d.metadata,
         }
     }
 }
 
 impl From<RawImage> for imgopt_codecs::DecodedPixels {
     fn from(r: RawImage) -> Self {
-        Self {
-            width: r.dimensions.width,
-            height: r.dimensions.height,
-            pixel_format: r.color_type.into(),
-            data: r.data,
-        }
+        Self::with_metadata(
+            r.dimensions.width,
+            r.dimensions.height,
+            r.color_type.into(),
+            r.data,
+            r.metadata,
+        )
     }
 }
 

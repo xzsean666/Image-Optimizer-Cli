@@ -8,18 +8,25 @@ use crate::model::{
     EntryStatus, Manifest, ManifestEntry, ManifestOptimizationRecord, ManifestSourceRecord,
     ManifestStorageRecord,
 };
-use crate::store::ManifestStore;
+use crate::store::{ManifestLock, ManifestStore};
 
 /// Adapter connecting ManifestStore and durable Manifest to the SyncManifest pipeline contract.
+/// Holds an exclusive advisory lock for the lifetime of the sync run.
 pub struct ManifestSyncAdapter {
     pub store: ManifestStore,
     pub manifest: Manifest,
+    _lock: ManifestLock,
 }
 
 impl ManifestSyncAdapter {
     pub fn new(store: ManifestStore, optimizer_version: &str) -> CoreResult<Self> {
+        let lock = store.acquire_lock()?;
         let manifest = store.load_or_init(optimizer_version)?;
-        Ok(Self { store, manifest })
+        Ok(Self {
+            store,
+            manifest,
+            _lock: lock,
+        })
     }
 }
 
@@ -60,9 +67,10 @@ impl SyncManifest for ManifestSyncAdapter {
         opt_res: &OptimizationResult,
         storage_out: &SyncStorageOutput,
     ) {
+        let sha_hex = opt_res.source_sha256.to_hex();
         let entry = ManifestEntry {
             source: ManifestSourceRecord {
-                sha256: opt_res.source_sha256.to_hex(),
+                sha256: sha_hex,
                 format: opt_res.profile.format,
                 byte_size: opt_res.profile.byte_size,
                 dimensions: opt_res.profile.dimensions,
@@ -90,7 +98,25 @@ impl SyncManifest for ManifestSyncAdapter {
         self.manifest.insert(entry);
     }
 
-    fn record_failure(&mut self, _source_path: &str, _source_sha256: Option<&str>, _error: &str) {}
+    fn record_failure(&mut self, source_path: &str, source_sha256: Option<&str>, _error: &str) {
+        if let Some(sha) = source_sha256 {
+            if let Some(existing) = self.manifest.get_mut(sha) {
+                if !existing.known_paths.iter().any(|p| p == source_path) {
+                    existing.known_paths.push(source_path.to_string());
+                }
+                if existing.status != EntryStatus::Uploaded
+                    && existing.status != EntryStatus::Verified
+                {
+                    existing.status = EntryStatus::Failed;
+                }
+                self.manifest.touch();
+            }
+        }
+    }
+
+    fn record_path_alias(&mut self, source_sha256: &str, source_path: &str) {
+        self.manifest.add_path_alias(source_sha256, source_path);
+    }
 
     fn commit(&self) -> CoreResult<()> {
         self.store.save(&self.manifest).map_err(|e| {

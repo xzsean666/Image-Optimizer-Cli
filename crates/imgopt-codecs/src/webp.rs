@@ -1,6 +1,7 @@
+use crate::decode_with_image_reader;
 use crate::interface::{
-    CodecCapabilities, CodecError, CodecFormat, DecodedPixels, EncodeOptions, EncodedOutput,
-    ImageCodec, PixelFormat,
+    CodecCapabilities, CodecError, CodecFormat, DecodeLimits, DecodedPixels, EncodeOptions,
+    EncodedOutput, ImageCodec, ImageMetadataChunks, MetadataPreservation, PixelFormat,
 };
 
 /// Codec adapter for WebP image encoding and decoding.
@@ -18,28 +19,20 @@ impl ImageCodec for WebpCodec {
     }
 
     fn decode(&self, input_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
-        if input_bytes.is_empty() {
-            return Err(CodecError::DecodeError("empty input bytes".into()));
-        }
+        self.decode_with_limits(input_bytes, &DecodeLimits::default())
+    }
 
-        let img = image::load_from_memory_with_format(input_bytes, image::ImageFormat::WebP)
-            .map_err(|e| CodecError::DecodeError(format!("failed to decode WebP: {e}")))?;
-
-        let width = img.width();
-        let height = img.height();
-
-        let (pixel_format, data) = match img.color() {
-            image::ColorType::L8 => (PixelFormat::Grayscale8, img.into_luma8().into_raw()),
-            image::ColorType::La8 => (
-                PixelFormat::GrayscaleAlpha8,
-                img.into_luma_alpha8().into_raw(),
-            ),
-            image::ColorType::Rgb8 => (PixelFormat::Rgb8, img.into_rgb8().into_raw()),
-            image::ColorType::Rgba8 => (PixelFormat::Rgba8, img.into_rgba8().into_raw()),
-            _ => (PixelFormat::Rgba8, img.into_rgba8().into_raw()),
-        };
-
-        Ok(DecodedPixels::new(width, height, pixel_format, data))
+    fn decode_with_limits(
+        &self,
+        input_bytes: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<DecodedPixels, CodecError> {
+        decode_with_image_reader(
+            input_bytes,
+            image::ImageFormat::WebP,
+            CodecFormat::Webp,
+            limits,
+        )
     }
 
     fn encode(
@@ -53,43 +46,44 @@ impl ImageCodec for WebpCodec {
             ));
         }
 
-        let quality = options.quality.clamp(1, 100) as f32;
+        let mut config = webp::WebPConfig::new().map_err(|()| {
+            CodecError::EncodeError("failed to initialize WebP encoder configuration".into())
+        })?;
+        config.lossless = if options.lossless { 1 } else { 0 };
+        config.alpha_compression = if options.lossless { 0 } else { 1 };
+        config.quality = options.quality.clamp(1, 100) as f32;
+        config.method = i32::from(options.effort.clamp(1, 6));
 
-        let encoded_bytes = match pixels.pixel_format {
+        let mut encoded_bytes = match pixels.pixel_format {
             PixelFormat::Rgb8 => {
                 let encoder = webp::Encoder::from_rgb(&pixels.data, pixels.width, pixels.height);
-                if options.lossless {
-                    encoder.encode_lossless().to_vec()
-                } else {
-                    encoder.encode(quality).to_vec()
-                }
+                encoder
+                    .encode_advanced(&config)
+                    .map_err(|e| CodecError::EncodeError(format!("WebP encode error: {e:?}")))?
+                    .to_vec()
             }
             PixelFormat::Rgba8 => {
                 let encoder = webp::Encoder::from_rgba(&pixels.data, pixels.width, pixels.height);
-                if options.lossless {
-                    encoder.encode_lossless().to_vec()
-                } else {
-                    encoder.encode(quality).to_vec()
-                }
+                encoder
+                    .encode_advanced(&config)
+                    .map_err(|e| CodecError::EncodeError(format!("WebP encode error: {e:?}")))?
+                    .to_vec()
             }
             PixelFormat::Grayscale8 => {
-                let num_pixels = (pixels.width * pixels.height) as usize;
-                let mut rgb_data = Vec::with_capacity(num_pixels * 3);
+                let mut rgb_data = Vec::with_capacity(pixels.data.len() * 3);
                 for &l in &pixels.data {
                     rgb_data.push(l);
                     rgb_data.push(l);
                     rgb_data.push(l);
                 }
                 let encoder = webp::Encoder::from_rgb(&rgb_data, pixels.width, pixels.height);
-                if options.lossless {
-                    encoder.encode_lossless().to_vec()
-                } else {
-                    encoder.encode(quality).to_vec()
-                }
+                encoder
+                    .encode_advanced(&config)
+                    .map_err(|e| CodecError::EncodeError(format!("WebP encode error: {e:?}")))?
+                    .to_vec()
             }
             PixelFormat::GrayscaleAlpha8 => {
-                let num_pixels = (pixels.width * pixels.height) as usize;
-                let mut rgba_data = Vec::with_capacity(num_pixels * 4);
+                let mut rgba_data = Vec::with_capacity(pixels.data.len() * 2);
                 for chunk in pixels.data.chunks_exact(2) {
                     let l = chunk[0];
                     let a = chunk[1];
@@ -99,11 +93,10 @@ impl ImageCodec for WebpCodec {
                     rgba_data.push(a);
                 }
                 let encoder = webp::Encoder::from_rgba(&rgba_data, pixels.width, pixels.height);
-                if options.lossless {
-                    encoder.encode_lossless().to_vec()
-                } else {
-                    encoder.encode(quality).to_vec()
-                }
+                encoder
+                    .encode_advanced(&config)
+                    .map_err(|e| CodecError::EncodeError(format!("WebP encode error: {e:?}")))?
+                    .to_vec()
             }
         };
 
@@ -113,6 +106,18 @@ impl ImageCodec for WebpCodec {
             ));
         }
 
+        let preserve = options.effective_preservation();
+        if preserve.any() && !pixels.metadata.is_empty() {
+            encoded_bytes = mux_webp_metadata(
+                &encoded_bytes,
+                pixels.width,
+                pixels.height,
+                pixels.pixel_format.has_alpha(),
+                &pixels.metadata,
+                preserve,
+            );
+        }
+
         Ok(EncodedOutput {
             format: CodecFormat::Webp,
             bytes: encoded_bytes,
@@ -120,6 +125,134 @@ impl ImageCodec for WebpCodec {
             height: pixels.height,
             effective_options: options.clone(),
         })
+    }
+}
+
+/// Mux ICCP, EXIF, and XMP chunks into an extended WebP (VP8X) RIFF container.
+fn mux_webp_metadata(
+    webp_bytes: &[u8],
+    width: u32,
+    height: u32,
+    has_alpha: bool,
+    metadata: &ImageMetadataChunks,
+    preserve: MetadataPreservation,
+) -> Vec<u8> {
+    if webp_bytes.len() < 20 || &webp_bytes[0..4] != b"RIFF" || &webp_bytes[8..12] != b"WEBP" {
+        return webp_bytes.to_vec();
+    }
+
+    let icc = preserve
+        .preserve_icc
+        .then_some(metadata.icc_profile.as_deref())
+        .flatten()
+        .filter(|b| !b.is_empty());
+    let exif = preserve
+        .preserve_exif
+        .then_some(metadata.exif.as_deref())
+        .flatten()
+        .filter(|b| !b.is_empty());
+    let xmp = preserve
+        .preserve_xmp
+        .then_some(metadata.xmp.as_deref())
+        .flatten()
+        .filter(|b| !b.is_empty());
+
+    if icc.is_none() && exif.is_none() && xmp.is_none() {
+        return webp_bytes.to_vec();
+    }
+
+    let Some((w_m1, h_m1)) = width.checked_sub(1).zip(height.checked_sub(1)) else {
+        return webp_bytes.to_vec();
+    };
+    if w_m1 > 0x00FF_FFFF || h_m1 > 0x00FF_FFFF {
+        return webp_bytes.to_vec();
+    }
+
+    let mut flags: u8 = 0;
+    if icc.is_some() {
+        flags |= 1 << 5; // ICC profile
+    }
+    if has_alpha {
+        flags |= 1 << 4; // Alpha
+    }
+    if exif.is_some() {
+        flags |= 1 << 3; // EXIF
+    }
+    if xmp.is_some() {
+        flags |= 1 << 2; // XMP
+    }
+
+    let mut body = Vec::with_capacity(webp_bytes.len() + 64);
+    body.extend_from_slice(b"WEBP");
+
+    // Write VP8X chunk (10 bytes payload)
+    body.extend_from_slice(b"VP8X");
+    body.extend_from_slice(&10u32.to_le_bytes());
+    body.push(flags);
+    body.extend_from_slice(&[0u8; 3]);
+    body.extend_from_slice(&w_m1.to_le_bytes()[..3]);
+    body.extend_from_slice(&h_m1.to_le_bytes()[..3]);
+
+    // ICCP must precede image bitstream chunks per WebP spec
+    if let Some(data) = icc {
+        append_riff_chunk(&mut body, b"ICCP", data);
+    }
+
+    // Copy original image chunks (skipping any pre-existing VP8X/ICCP/EXIF/XMP)
+    let mut pos = 12usize;
+    while pos + 8 <= webp_bytes.len() {
+        let fourcc = &webp_bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            webp_bytes[pos + 4],
+            webp_bytes[pos + 5],
+            webp_bytes[pos + 6],
+            webp_bytes[pos + 7],
+        ]) as usize;
+        let data_start = pos + 8;
+        let Some(data_end) = data_start.checked_add(size) else {
+            return webp_bytes.to_vec();
+        };
+        if data_end > webp_bytes.len() {
+            return webp_bytes.to_vec();
+        }
+
+        if fourcc != b"VP8X" && fourcc != b"ICCP" && fourcc != b"EXIF" && fourcc != b"XMP " {
+            let Ok(fourcc_arr): Result<[u8; 4], _> = fourcc.try_into() else {
+                return webp_bytes.to_vec();
+            };
+            append_riff_chunk(&mut body, &fourcc_arr, &webp_bytes[data_start..data_end]);
+        }
+
+        let padded = size + (size & 1);
+        pos = data_start.saturating_add(padded);
+    }
+
+    if let Some(data) = exif {
+        append_riff_chunk(&mut body, b"EXIF", data);
+    }
+    if let Some(data) = xmp {
+        append_riff_chunk(&mut body, b"XMP ", data);
+    }
+
+    let Ok(riff_len) = u32::try_from(body.len()) else {
+        return webp_bytes.to_vec();
+    };
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_len.to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn append_riff_chunk(buf: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) {
+    let Ok(len) = u32::try_from(data.len()) else {
+        return;
+    };
+    buf.extend_from_slice(fourcc);
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        buf.push(0);
     }
 }
 
@@ -147,6 +280,7 @@ mod tests {
             effort: 4,
             lossless: true,
             preserve_metadata: false,
+            ..Default::default()
         };
 
         let encoded = codec.encode(&pixels, &options).unwrap();
@@ -178,6 +312,7 @@ mod tests {
             effort: 4,
             lossless: false,
             preserve_metadata: false,
+            ..Default::default()
         };
 
         let encoded = codec.encode(&pixels, &options).unwrap();
@@ -186,6 +321,42 @@ mod tests {
         let decoded = codec.decode(&encoded.bytes).unwrap();
         assert_eq!(decoded.width, width);
         assert_eq!(decoded.height, height);
+    }
+
+    #[test]
+    fn test_webp_metadata_preservation_and_stripping() {
+        let codec = WebpCodec;
+        let icc = b"fake-webp-icc".to_vec();
+        let exif = vec![
+            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let xmp = b"<x:xmpmeta/>".to_vec();
+
+        let pixels = DecodedPixels::with_metadata(
+            4,
+            4,
+            PixelFormat::Rgb8,
+            vec![128; 4 * 4 * 3],
+            ImageMetadataChunks {
+                icc_profile: Some(icc.clone()),
+                exif: Some(exif.clone()),
+                xmp: Some(xmp.clone()),
+            },
+        );
+
+        let opts_keep = EncodeOptions {
+            preserve_metadata: true,
+            ..Default::default()
+        };
+        let encoded = codec.encode(&pixels, &opts_keep).unwrap();
+        let decoded = codec.decode(&encoded.bytes).unwrap();
+        assert_eq!(decoded.metadata.icc_profile.as_deref(), Some(icc.as_slice()));
+        assert_eq!(decoded.metadata.exif.as_deref(), Some(exif.as_slice()));
+        assert_eq!(decoded.metadata.xmp.as_deref(), Some(xmp.as_slice()));
+
+        let encoded_strip = codec.encode(&pixels, &EncodeOptions::default()).unwrap();
+        let decoded_strip = codec.decode(&encoded_strip.bytes).unwrap();
+        assert!(decoded_strip.metadata.is_empty());
     }
 
     #[test]

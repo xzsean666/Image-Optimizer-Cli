@@ -3,6 +3,8 @@
 .env
 .env.*
 .imgopt/
+.imgopt-manifest.json
+.imgopt-manifest.json.lock
 *.log
 result.json
 benchmark-results.json
@@ -10,4 +12,3 @@ benchmark-results.json
 *.tar.gz
 *.zip
 *.sha256
-

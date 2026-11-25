@@ -1,27 +1,21 @@
-# Next Session Handoff
+# Project State & Audit Handoff
 
 ## Current State
 
-The repository contains the V1 goal, architecture/specification documents,
-37 task definitions, and Gemini execution prompts. No Rust workspace or source
-implementation exists yet.
+All 37 V1 backlog tasks are implemented across the 6 workspace crates (`imgopt-codecs`, `imgopt-quality`, `imgopt-core`, `imgopt-manifest`, `imgopt-storage`, `imgopt-cli`), and a full security, performance, and functional hardening audit pass has been completed.
 
-## Next Task
+## Key Hardening Applied
 
-Execute `task-001-bootstrap-workspace` using
-`prompts/task-001-bootstrap-workspace.md`.
+- **Security & Resource Limits**: Bounded preflight file reads, header-level dimension/pixel/allocation checks before decoding, explicit `u16` dimension guards in JPEG encoding, removal of committed test manifests containing sensitive endpoints/credentials, removal of automatic presigned URL persistence, strict S3 config/URL validation, and exclusive `tempfile` atomic writes.
+- **Performance**: Parallel bounded execution (`execute_batch_scoped`) wired into `sync`, `optimize`, and `benchmark`; streaming `hash_file` before reads on `sync` skips; single-pass integer block accumulation in `compute_ssim`; lossless fast path; reusable `ureq::Agent` connection pool in `S3Client`.
+- **Functionality**: Cross-channel quality projection (RGBA->JPEG, Grayscale->WebP/JPEG), EXIF orientation auto-normalization, real metadata preservation (`--preserve-metadata`), no-bloat fallback, strict 404 verification failures in `upload_and_verify` and `verify --check-storage`, and output collision disambiguation.
 
-## Required First Actions
+## Verification Gates
 
-1. Read `GOAL.md`, `Agent.md`, `docs/ARCHITECTURE.md`, `docs/SPEC.md`, and the
-   task file.
-2. Check `git status --short`.
-3. Create only the workspace files listed by task 001.
-4. Run the task's Cargo metadata, build, and test checks.
-5. Update the task status and provide the required handoff report.
+Run the workspace gates before releasing:
 
-## Known Constraints
-
-Do not claim Cargo checks pass before task 001 creates the workspace. Do not
-introduce AVIF, JPEG XL, storage credentials, or production infrastructure in
-the bootstrap task.
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+```

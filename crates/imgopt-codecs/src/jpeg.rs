@@ -1,7 +1,10 @@
+use crate::decode_with_image_reader;
 use crate::interface::{
-    CodecCapabilities, CodecError, CodecFormat, DecodedPixels, EncodeOptions, EncodedOutput,
-    ImageCodec, PixelFormat,
+    CodecCapabilities, CodecError, CodecFormat, DecodeLimits, DecodedPixels, EncodeOptions,
+    EncodedOutput, ImageCodec, PixelFormat,
 };
+
+const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 
 /// Codec adapter for JPEG image encoding and decoding.
 #[derive(Debug, Default, Clone, Copy)]
@@ -18,34 +21,20 @@ impl ImageCodec for JpegCodec {
     }
 
     fn decode(&self, input_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
-        if input_bytes.is_empty() {
-            return Err(CodecError::DecodeError("empty input bytes".into()));
-        }
+        self.decode_with_limits(input_bytes, &DecodeLimits::default())
+    }
 
-        let img = image::load_from_memory_with_format(input_bytes, image::ImageFormat::Jpeg)
-            .map_err(|e| CodecError::DecodeError(format!("failed to decode JPEG: {e}")))?;
-
-        let width = img.width();
-        let height = img.height();
-
-        let (pixel_format, data) = match img.color() {
-            image::ColorType::L8 => (PixelFormat::Grayscale8, img.into_luma8().into_raw()),
-            image::ColorType::La8 => {
-                let rgb = img.into_rgb8();
-                (PixelFormat::Rgb8, rgb.into_raw())
-            }
-            image::ColorType::Rgb8 => (PixelFormat::Rgb8, img.into_rgb8().into_raw()),
-            image::ColorType::Rgba8 => {
-                let rgb = img.into_rgb8();
-                (PixelFormat::Rgb8, rgb.into_raw())
-            }
-            _ => {
-                let rgb = img.into_rgb8();
-                (PixelFormat::Rgb8, rgb.into_raw())
-            }
-        };
-
-        Ok(DecodedPixels::new(width, height, pixel_format, data))
+    fn decode_with_limits(
+        &self,
+        input_bytes: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<DecodedPixels, CodecError> {
+        decode_with_image_reader(
+            input_bytes,
+            image::ImageFormat::Jpeg,
+            CodecFormat::Jpeg,
+            limits,
+        )
     }
 
     fn encode(
@@ -58,6 +47,19 @@ impl ImageCodec for JpegCodec {
                 "invalid pixel buffer dimensions/data size".into(),
             ));
         }
+
+        let width_u16 = u16::try_from(pixels.width).map_err(|_| {
+            CodecError::InvalidParameter(format!(
+                "JPEG width {} exceeds 16-bit maximum of 65535",
+                pixels.width
+            ))
+        })?;
+        let height_u16 = u16::try_from(pixels.height).map_err(|_| {
+            CodecError::InvalidParameter(format!(
+                "JPEG height {} exceeds 16-bit maximum of 65535",
+                pixels.height
+            ))
+        })?;
 
         let quality = options.quality.clamp(1, 100);
         let mut encoded_bytes = Vec::new();
@@ -72,13 +74,43 @@ impl ImageCodec for JpegCodec {
             encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
         }
 
+        let preserve = options.effective_preservation();
+        if preserve.preserve_icc {
+            if let Some(ref icc) = pixels.metadata.icc_profile {
+                if !icc.is_empty() {
+                    let _ = encoder.add_icc_profile(icc);
+                }
+            }
+        }
+        if preserve.preserve_exif {
+            if let Some(ref exif) = pixels.metadata.exif {
+                if !exif.is_empty() && exif.len() <= 65_527 {
+                    let _ = encoder.add_exif_metadata(exif);
+                }
+            }
+        }
+        if preserve.preserve_xmp {
+            if let Some(ref xmp) = pixels.metadata.xmp {
+                if !xmp.is_empty() {
+                    let mut seg = Vec::with_capacity(XMP_HEADER.len() + xmp.len());
+                    if !xmp.starts_with(XMP_HEADER) {
+                        seg.extend_from_slice(XMP_HEADER);
+                    }
+                    seg.extend_from_slice(xmp);
+                    if seg.len() <= 65_533 {
+                        let _ = encoder.add_app_segment(1, seg);
+                    }
+                }
+            }
+        }
+
         match pixels.pixel_format {
             PixelFormat::Grayscale8 => {
                 encoder
                     .encode(
                         &pixels.data,
-                        pixels.width as u16,
-                        pixels.height as u16,
+                        width_u16,
+                        height_u16,
                         jpeg_encoder::ColorType::Luma,
                     )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
@@ -87,54 +119,25 @@ impl ImageCodec for JpegCodec {
                 encoder
                     .encode(
                         &pixels.data,
-                        pixels.width as u16,
-                        pixels.height as u16,
+                        width_u16,
+                        height_u16,
                         jpeg_encoder::ColorType::Rgb,
                     )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
             }
             PixelFormat::Rgba8 => {
-                // Flatten RGBA to RGB with white background
-                let num_pixels = (pixels.width * pixels.height) as usize;
-                let mut rgb_data = Vec::with_capacity(num_pixels * 3);
-                for chunk in pixels.data.chunks_exact(4) {
-                    let r = chunk[0];
-                    let g = chunk[1];
-                    let b = chunk[2];
-                    let a = chunk[3] as u32;
-
-                    let out_r = ((r as u32 * a + 255 * (255 - a)) / 255) as u8;
-                    let out_g = ((g as u32 * a + 255 * (255 - a)) / 255) as u8;
-                    let out_b = ((b as u32 * a + 255 * (255 - a)) / 255) as u8;
-                    rgb_data.push(out_r);
-                    rgb_data.push(out_g);
-                    rgb_data.push(out_b);
-                }
-
+                let rgb_data = flatten_rgba_on_white(&pixels.data);
                 encoder
-                    .encode(
-                        &rgb_data,
-                        pixels.width as u16,
-                        pixels.height as u16,
-                        jpeg_encoder::ColorType::Rgb,
-                    )
+                    .encode(&rgb_data, width_u16, height_u16, jpeg_encoder::ColorType::Rgb)
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
             }
             PixelFormat::GrayscaleAlpha8 => {
-                let num_pixels = (pixels.width * pixels.height) as usize;
-                let mut gray_data = Vec::with_capacity(num_pixels);
-                for chunk in pixels.data.chunks_exact(2) {
-                    let l = chunk[0];
-                    let a = chunk[1] as u32;
-                    let out_l = ((l as u32 * a + 255 * (255 - a)) / 255) as u8;
-                    gray_data.push(out_l);
-                }
-
+                let gray_data = flatten_la_on_white(&pixels.data);
                 encoder
                     .encode(
                         &gray_data,
-                        pixels.width as u16,
-                        pixels.height as u16,
+                        width_u16,
+                        height_u16,
                         jpeg_encoder::ColorType::Luma,
                     )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
@@ -151,9 +154,32 @@ impl ImageCodec for JpegCodec {
     }
 }
 
+fn flatten_rgba_on_white(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb_data = Vec::with_capacity((rgba.len() / 4) * 3);
+    for chunk in rgba.chunks_exact(4) {
+        let a = u32::from(chunk[3]);
+        let inv = 255 - a;
+        rgb_data.push(((u32::from(chunk[0]) * a + 255 * inv) / 255) as u8);
+        rgb_data.push(((u32::from(chunk[1]) * a + 255 * inv) / 255) as u8);
+        rgb_data.push(((u32::from(chunk[2]) * a + 255 * inv) / 255) as u8);
+    }
+    rgb_data
+}
+
+fn flatten_la_on_white(la: &[u8]) -> Vec<u8> {
+    let mut gray_data = Vec::with_capacity(la.len() / 2);
+    for chunk in la.chunks_exact(2) {
+        let a = u32::from(chunk[1]);
+        let inv = 255 - a;
+        gray_data.push(((u32::from(chunk[0]) * a + 255 * inv) / 255) as u8);
+    }
+    gray_data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interface::{ImageMetadataChunks, MetadataPreservation};
 
     #[test]
     fn test_jpeg_encode_and_decode_roundtrip() {
@@ -175,6 +201,7 @@ mod tests {
             effort: 4,
             lossless: false,
             preserve_metadata: false,
+            ..Default::default()
         };
 
         let encoded = codec.encode(&pixels, &options).unwrap();
@@ -206,6 +233,58 @@ mod tests {
         assert_eq!(decoded.width, width);
         assert_eq!(decoded.height, height);
         assert_eq!(decoded.pixel_format, PixelFormat::Rgb8);
+    }
+
+    #[test]
+    fn test_jpeg_rejects_dimensions_above_u16() {
+        let codec = JpegCodec;
+        // Construct invalid-for-JPEG dimension without allocating multi-GB via manual check
+        let pixels = DecodedPixels::new(70_000, 1, PixelFormat::Grayscale8, vec![0; 70_000]);
+        let err = codec.encode(&pixels, &EncodeOptions::default()).unwrap_err();
+        assert!(matches!(err, CodecError::InvalidParameter(_)));
+    }
+
+    #[test]
+    fn test_jpeg_metadata_preservation() {
+        let codec = JpegCodec;
+        let exif_tiff = vec![
+            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let xmp = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>".to_vec();
+        let icc = b"fake-icc-profile".to_vec();
+
+        let pixels = DecodedPixels::with_metadata(
+            4,
+            4,
+            PixelFormat::Rgb8,
+            vec![128; 4 * 4 * 3],
+            ImageMetadataChunks {
+                icc_profile: Some(icc.clone()),
+                exif: Some(exif_tiff.clone()),
+                xmp: Some(xmp.clone()),
+            },
+        );
+
+        let opts_preserve = EncodeOptions {
+            metadata_preservation: MetadataPreservation {
+                preserve_exif: true,
+                preserve_icc: true,
+                preserve_xmp: true,
+            },
+            ..Default::default()
+        };
+        let encoded = codec.encode(&pixels, &opts_preserve).unwrap();
+        let decoded = codec.decode(&encoded.bytes).unwrap();
+        assert_eq!(decoded.metadata.icc_profile.as_deref(), Some(icc.as_slice()));
+        assert_eq!(
+            decoded.metadata.exif.as_deref(),
+            Some(exif_tiff.as_slice())
+        );
+        assert_eq!(decoded.metadata.xmp.as_deref(), Some(xmp.as_slice()));
+
+        let encoded_stripped = codec.encode(&pixels, &EncodeOptions::default()).unwrap();
+        let decoded_stripped = codec.decode(&encoded_stripped.bytes).unwrap();
+        assert!(decoded_stripped.metadata.is_empty());
     }
 
     #[test]

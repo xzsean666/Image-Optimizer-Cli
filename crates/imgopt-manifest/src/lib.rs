@@ -11,7 +11,7 @@ pub use model::{
     ManifestStorageRecord, CURRENT_SCHEMA_VERSION,
 };
 pub use result::{RunItemStatus, RunResult, RunResultRecord, RunSummary};
-pub use store::ManifestStore;
+pub use store::{ManifestLock, ManifestStore};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

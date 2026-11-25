@@ -1,9 +1,11 @@
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::ImageEncoder;
+use oxipng::StripChunks;
 
+use crate::decode_with_image_reader;
 use crate::interface::{
-    CodecCapabilities, CodecError, CodecFormat, DecodedPixels, EncodeOptions, EncodedOutput,
-    ImageCodec, PixelFormat,
+    CodecCapabilities, CodecError, CodecFormat, DecodeLimits, DecodedPixels, EncodeOptions,
+    EncodedOutput, ImageCodec, PixelFormat,
 };
 
 /// Codec adapter for PNG image encoding and decoding.
@@ -21,28 +23,20 @@ impl ImageCodec for PngCodec {
     }
 
     fn decode(&self, input_bytes: &[u8]) -> Result<DecodedPixels, CodecError> {
-        if input_bytes.is_empty() {
-            return Err(CodecError::DecodeError("empty input bytes".into()));
-        }
+        self.decode_with_limits(input_bytes, &DecodeLimits::default())
+    }
 
-        let img = image::load_from_memory_with_format(input_bytes, image::ImageFormat::Png)
-            .map_err(|e| CodecError::DecodeError(format!("failed to decode PNG: {e}")))?;
-
-        let width = img.width();
-        let height = img.height();
-
-        let (pixel_format, data) = match img.color() {
-            image::ColorType::L8 => (PixelFormat::Grayscale8, img.into_luma8().into_raw()),
-            image::ColorType::La8 => (
-                PixelFormat::GrayscaleAlpha8,
-                img.into_luma_alpha8().into_raw(),
-            ),
-            image::ColorType::Rgb8 => (PixelFormat::Rgb8, img.into_rgb8().into_raw()),
-            image::ColorType::Rgba8 => (PixelFormat::Rgba8, img.into_rgba8().into_raw()),
-            _ => (PixelFormat::Rgba8, img.into_rgba8().into_raw()),
-        };
-
-        Ok(DecodedPixels::new(width, height, pixel_format, data))
+    fn decode_with_limits(
+        &self,
+        input_bytes: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<DecodedPixels, CodecError> {
+        decode_with_image_reader(
+            input_bytes,
+            image::ImageFormat::Png,
+            CodecFormat::Png,
+            limits,
+        )
     }
 
     fn encode(
@@ -56,14 +50,29 @@ impl ImageCodec for PngCodec {
             ));
         }
 
-        let (compression, filter) = match options.effort {
-            5..=6 => (CompressionType::Best, FilterType::Adaptive),
-            3..=4 => (CompressionType::Default, FilterType::Adaptive),
-            _ => (CompressionType::Fast, FilterType::NoFilter),
-        };
-
+        // Fast initial serialization because oxipng immediately re-evaluates filters and DEFLATE.
         let mut encoded_bytes = Vec::new();
-        let encoder = PngEncoder::new_with_quality(&mut encoded_bytes, compression, filter);
+        let mut encoder = PngEncoder::new_with_quality(
+            &mut encoded_bytes,
+            CompressionType::Fast,
+            FilterType::NoFilter,
+        );
+
+        let preserve = options.effective_preservation();
+        if preserve.preserve_icc {
+            if let Some(ref icc) = pixels.metadata.icc_profile {
+                if !icc.is_empty() {
+                    let _ = encoder.set_icc_profile(icc.clone());
+                }
+            }
+        }
+        if preserve.preserve_exif {
+            if let Some(ref exif) = pixels.metadata.exif {
+                if !exif.is_empty() {
+                    let _ = encoder.set_exif_metadata(exif.clone());
+                }
+            }
+        }
 
         let color_type = match pixels.pixel_format {
             PixelFormat::Grayscale8 => image::ExtendedColorType::L8,
@@ -76,12 +85,37 @@ impl ImageCodec for PngCodec {
             .write_image(&pixels.data, pixels.width, pixels.height, color_type)
             .map_err(|e| CodecError::EncodeError(format!("PNG encode error: {e}")))?;
 
+        if preserve.preserve_xmp {
+            if let Some(ref xmp) = pixels.metadata.xmp {
+                if !xmp.is_empty() {
+                    encoded_bytes = insert_png_xmp_itxt(encoded_bytes, xmp);
+                }
+            }
+        }
+
         // Apply OxiPNG lossless compression optimization
         let opt_level = options.effort.clamp(1, 6);
         let mut oxipng_opts = oxipng::Options::from_preset(opt_level);
         oxipng_opts.fix_errors = true;
+        oxipng_opts.strip = if preserve.any() {
+            let mut keep = oxipng::IndexSet::new();
+            if preserve.preserve_icc {
+                keep.insert(*b"iCCP");
+                keep.insert(*b"sRGB");
+            }
+            if preserve.preserve_exif {
+                keep.insert(*b"eXIf");
+            }
+            if preserve.preserve_xmp {
+                keep.insert(*b"iTXt");
+            }
+            StripChunks::Keep(keep)
+        } else {
+            StripChunks::All
+        };
+
         if let Ok(optimized) = oxipng::optimize_from_memory(&encoded_bytes, &oxipng_opts) {
-            if optimized.len() < encoded_bytes.len() {
+            if optimized.len() < encoded_bytes.len() || !preserve.any() {
                 encoded_bytes = optimized;
             }
         }
@@ -96,9 +130,73 @@ impl ImageCodec for PngCodec {
     }
 }
 
+fn insert_png_xmp_itxt(png_bytes: Vec<u8>, xmp: &[u8]) -> Vec<u8> {
+    if png_bytes.len() < 8 || &png_bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return png_bytes;
+    }
+
+    // Find the offset of the first IDAT chunk so PngDecoder::read_info() reads iTXt before IDAT
+    let mut pos = 8usize;
+    let mut insert_at = None;
+    while pos + 12 <= png_bytes.len() {
+        let len = u32::from_be_bytes([
+            png_bytes[pos],
+            png_bytes[pos + 1],
+            png_bytes[pos + 2],
+            png_bytes[pos + 3],
+        ]) as usize;
+        let chunk_type = &png_bytes[pos + 4..pos + 8];
+        if chunk_type == b"IDAT" || chunk_type == b"IEND" {
+            insert_at = Some(pos);
+            break;
+        }
+        let Some(next) = pos.checked_add(12).and_then(|p| p.checked_add(len)) else {
+            return png_bytes;
+        };
+        pos = next;
+    }
+    let Some(split_pos) = insert_at else {
+        return png_bytes;
+    };
+
+    let mut payload = Vec::with_capacity(22 + xmp.len());
+    payload.extend_from_slice(b"XML:com.adobe.xmp\0\0\0\0\0");
+    payload.extend_from_slice(xmp);
+
+    let Ok(len) = u32::try_from(payload.len()) else {
+        return png_bytes;
+    };
+
+    let mut crc_input = Vec::with_capacity(4 + payload.len());
+    crc_input.extend_from_slice(b"iTXt");
+    crc_input.extend_from_slice(&payload);
+    let crc = png_crc32(&crc_input);
+
+    let mut out = Vec::with_capacity(png_bytes.len() + 12 + payload.len());
+    out.extend_from_slice(&png_bytes[..split_pos]);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&crc_input);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out.extend_from_slice(&png_bytes[split_pos..]);
+    out
+}
+
+fn png_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interface::{ImageMetadataChunks, MetadataPreservation};
 
     #[test]
     fn test_png_rgb_lossless_roundtrip() {
@@ -148,6 +246,46 @@ mod tests {
             decoded.data, rgba,
             "Lossless PNG must preserve RGBA alpha channel exactly"
         );
+    }
+
+    #[test]
+    fn test_png_metadata_preservation_and_stripping() {
+        let codec = PngCodec;
+        let icc = b"fake-png-icc".to_vec();
+        let exif = vec![
+            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let xmp = b"<x:xmpmeta/>".to_vec();
+
+        let pixels = DecodedPixels::with_metadata(
+            4,
+            4,
+            PixelFormat::Rgb8,
+            vec![120; 4 * 4 * 3],
+            ImageMetadataChunks {
+                icc_profile: Some(icc.clone()),
+                exif: Some(exif.clone()),
+                xmp: Some(xmp.clone()),
+            },
+        );
+
+        let opts_keep = EncodeOptions {
+            metadata_preservation: MetadataPreservation {
+                preserve_exif: true,
+                preserve_icc: true,
+                preserve_xmp: true,
+            },
+            ..Default::default()
+        };
+        let encoded = codec.encode(&pixels, &opts_keep).unwrap();
+        let decoded = codec.decode(&encoded.bytes).unwrap();
+        assert_eq!(decoded.metadata.icc_profile.as_deref(), Some(icc.as_slice()));
+        assert_eq!(decoded.metadata.exif.as_deref(), Some(exif.as_slice()));
+        assert_eq!(decoded.metadata.xmp.as_deref(), Some(xmp.as_slice()));
+
+        let encoded_strip = codec.encode(&pixels, &EncodeOptions::default()).unwrap();
+        let decoded_strip = codec.decode(&encoded_strip.bytes).unwrap();
+        assert!(decoded_strip.metadata.is_empty());
     }
 
     #[test]

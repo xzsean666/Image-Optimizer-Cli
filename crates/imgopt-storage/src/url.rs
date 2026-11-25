@@ -15,7 +15,6 @@ pub fn derive_object_key(source_sha256: &str, format: &str) -> Result<String, St
         ));
     }
 
-    // Ensure source_sha256 is safe hex alphanumeric (no directory traversal or control characters)
     if !source_sha256
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -25,7 +24,6 @@ pub fn derive_object_key(source_sha256: &str, format: &str) -> Result<String, St
         ));
     }
 
-    // Ensure format is safe alphanumeric
     if !format.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(StorageError::InvalidParameter(
             "format contains invalid or unsafe characters".into(),
@@ -48,9 +46,13 @@ pub fn derive_object_key_with_prefix(
     if let Some(p) = prefix {
         let clean_p = p.trim().trim_matches('/');
         if !clean_p.is_empty() {
-            if clean_p.contains("..") {
+            if clean_p.contains("..")
+                || clean_p
+                    .chars()
+                    .any(|c| c.is_ascii_control() || matches!(c, '\\' | '?' | '#'))
+            {
                 return Err(StorageError::InvalidParameter(
-                    "key prefix cannot contain path traversal sequences ('..')".into(),
+                    "key prefix contains invalid or path traversal characters".into(),
                 ));
             }
             return Ok(format!("{clean_p}/{base_key}"));
@@ -74,18 +76,23 @@ pub fn build_public_url(public_url_base: &str, object_key: &str) -> Result<Strin
         ));
     }
 
-    if base.contains('\0') || base.chars().any(|c| c.is_ascii_control()) {
+    if base.chars().any(|c| c.is_ascii_control() || matches!(c, '?' | '#')) {
         return Err(StorageError::InvalidParameter(
-            "public_url_base contains invalid control characters".into(),
+            "public_url_base contains invalid characters".into(),
         ));
     }
 
     let clean_base = base.trim_end_matches('/');
     let clean_key = object_key.trim_start_matches('/');
 
-    if clean_key.contains("..") {
+    if clean_key.is_empty()
+        || clean_key.contains("..")
+        || clean_key
+            .chars()
+            .any(|c| c.is_ascii_control() || matches!(c, '\\' | '?' | '#'))
+    {
         return Err(StorageError::InvalidParameter(
-            "object_key cannot contain path traversal sequences ('..')".into(),
+            "object_key contains invalid or path traversal characters".into(),
         ));
     }
 
@@ -109,6 +116,7 @@ mod tests {
         let key =
             derive_object_key_with_prefix(Some("my-prefix/uploads"), "a1b2c3d4e5", "webp").unwrap();
         assert_eq!(key, "my-prefix/uploads/images/a1b2c3d4e5/optimized.webp");
+        assert!(derive_object_key_with_prefix(Some("a?b=c"), "a1b2c3d4e5", "webp").is_err());
     }
 
     #[test]
@@ -135,5 +143,6 @@ mod tests {
     fn test_build_public_url_invalid_base_or_traversal() {
         assert!(build_public_url("ftp://not-http.com", "img.webp").is_err());
         assert!(build_public_url("https://cdn.example.com", "images/../../escape.webp").is_err());
+        assert!(build_public_url("https://cdn.example.com", "images/a?foo=1").is_err());
     }
 }

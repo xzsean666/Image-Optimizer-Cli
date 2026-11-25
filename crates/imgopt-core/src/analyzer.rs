@@ -1,3 +1,8 @@
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+use imgopt_codecs::DecodeLimits;
 use serde::{Deserialize, Serialize};
 
 use crate::detect::detect_format;
@@ -18,10 +23,75 @@ impl Default for ResourceLimits {
         Self {
             max_input_bytes: 100 * 1024 * 1024, // 100 MB
             max_pixels: 64 * 1024 * 1024,       // 64 MP (e.g., 8192 x 8192)
-            max_width: Some(16384),
-            max_height: Some(16384),
+            max_width: Some(16_384),
+            max_height: Some(16_384),
         }
     }
+}
+
+impl ResourceLimits {
+    pub fn to_decode_limits(&self) -> DecodeLimits {
+        let max_alloc_bytes = self
+            .max_pixels
+            .checked_mul(4)
+            .map(|b| b.max(1024 * 1024));
+        DecodeLimits {
+            max_width: self.max_width,
+            max_height: self.max_height,
+            max_pixels: Some(self.max_pixels),
+            max_alloc_bytes,
+        }
+    }
+}
+
+/// Read a file safely into memory enforcing `max_bytes` both via `metadata()` before
+/// allocating and via bounded `Read::take` against TOCTOU file growth.
+pub fn read_file_bounded(path: &Path, max_bytes: u64, stage: PipelineStage) -> Result<Vec<u8>> {
+    let file = File::open(path).map_err(|e| {
+        ImgoptError::new(stage, ErrorKind::Io(format!("failed to open file: {e}"))).with_path(path)
+    })?;
+
+    let meta = file.metadata().map_err(|e| {
+        ImgoptError::new(
+            stage,
+            ErrorKind::Io(format!("failed to read file metadata: {e}")),
+        )
+        .with_path(path)
+    })?;
+
+    if meta.len() > max_bytes {
+        return Err(ImgoptError::new(
+            PipelineStage::ResourceCheck,
+            ErrorKind::ResourceLimitExceeded(format!(
+                "input size {} bytes exceeds configured limit of {} bytes",
+                meta.len(),
+                max_bytes
+            )),
+        )
+        .with_path(path));
+    }
+
+    let capacity = usize::try_from(meta.len().min(max_bytes)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(capacity);
+    let read_limit = max_bytes.saturating_add(1);
+    file.take(read_limit).read_to_end(&mut buf).map_err(|e| {
+        ImgoptError::new(stage, ErrorKind::Io(format!("failed to read file: {e}")))
+            .with_path(path)
+    })?;
+
+    if (buf.len() as u64) > max_bytes {
+        return Err(ImgoptError::new(
+            PipelineStage::ResourceCheck,
+            ErrorKind::ResourceLimitExceeded(format!(
+                "input size {} bytes exceeds configured limit of {} bytes",
+                buf.len(),
+                max_bytes
+            )),
+        )
+        .with_path(path));
+    }
+
+    Ok(buf)
 }
 
 /// Dynamic characteristics and classification hints discovered during decode.
@@ -62,12 +132,18 @@ pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<An
     let format = detect_format(bytes)?;
 
     let codec = imgopt_codecs::codec_for_format(format.into());
-    let decoded = codec.decode(bytes).map_err(|e| {
-        ImgoptError::new(
-            PipelineStage::Decode,
-            ErrorKind::Decode(format!("failed to decode image during analysis: {e}")),
-        )
-    })?;
+    let decode_limits = limits.to_decode_limits();
+    let decoded = codec
+        .decode_with_limits(bytes, &decode_limits)
+        .map_err(|e| match e {
+            imgopt_codecs::CodecError::ResourceLimitExceeded(msg) => {
+                ImgoptError::new(PipelineStage::ResourceCheck, ErrorKind::ResourceLimitExceeded(msg))
+            }
+            other => ImgoptError::new(
+                PipelineStage::Decode,
+                ErrorKind::Decode(format!("failed to decode image during analysis: {other}")),
+            ),
+        })?;
 
     let dimensions = Dimensions::new(decoded.width, decoded.height);
     let pixel_count = dimensions.pixel_count();
@@ -108,10 +184,18 @@ pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<An
 
     let raw_image: RawImage = decoded.into();
 
-    // Check metadata markers in bytes
-    let metadata = probe_metadata_markers(bytes, format);
+    // Combine decoder-extracted metadata with container header probing (e.g. for XMP)
+    let mut metadata = probe_metadata_markers(bytes, format);
+    if raw_image.metadata.exif.is_some() {
+        metadata.has_exif = true;
+    }
+    if raw_image.metadata.icc_profile.is_some() {
+        metadata.has_icc = true;
+    }
+    if raw_image.metadata.xmp.is_some() {
+        metadata.has_xmp = true;
+    }
 
-    // Compute pixel characteristics
     let characteristics = inspect_characteristics(&raw_image);
 
     let profile = ImageProfile {
@@ -129,55 +213,126 @@ pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<An
     })
 }
 
-fn probe_metadata_markers(bytes: &[u8], format: ImageFormat) -> ImageMetadata {
+/// Structurally parse container markers/chunks rather than scanning raw entropy.
+pub(crate) fn probe_metadata_markers(bytes: &[u8], format: ImageFormat) -> ImageMetadata {
     let mut meta = ImageMetadata::default();
     match format {
         ImageFormat::Jpeg => {
-            // Check for EXIF (APP1: 0xFFE1 + "Exif"), ICC (APP2: 0xFFE2 + "ICC_PROFILE"), XMP ("http://ns.adobe.com/xap/1.0/")
-            if bytes
-                .windows(6)
-                .any(|w| w == b"Exif\0\0" || w == b"Exif\0\xff")
-            {
-                meta.has_exif = true;
+            if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+                return meta;
             }
-            if bytes.windows(11).any(|w| w == b"ICC_PROFILE") {
-                meta.has_icc = true;
-            }
-            if bytes
-                .windows(28)
-                .any(|w| w == b"http://ns.adobe.com/xap/1.0/")
-            {
-                meta.has_xmp = true;
+            let mut pos = 2usize;
+            while pos + 1 < bytes.len() {
+                if bytes[pos] != 0xFF {
+                    pos += 1;
+                    continue;
+                }
+                while pos < bytes.len() && bytes[pos] == 0xFF {
+                    pos += 1;
+                }
+                if pos >= bytes.len() {
+                    break;
+                }
+                let marker = bytes[pos];
+                pos += 1;
+
+                // Standalone markers (TEM, RST0..7, SOI, EOI) or SOS (compressed scan start)
+                if marker == 0x00 || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+                    if marker == 0xD9 {
+                        break;
+                    }
+                    continue;
+                }
+                if marker == 0xDA {
+                    // Start of Scan: metadata markers precede SOS
+                    break;
+                }
+                if pos + 2 > bytes.len() {
+                    break;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                if seg_len < 2 || pos + seg_len > bytes.len() {
+                    break;
+                }
+                let payload = &bytes[pos + 2..pos + seg_len];
+                if marker == 0xE1 {
+                    if payload.starts_with(b"Exif\0\0") || payload.starts_with(b"Exif\0\xFF") {
+                        meta.has_exif = true;
+                    } else if payload.starts_with(b"http://ns.adobe.com/xap/1.0/\0") {
+                        meta.has_xmp = true;
+                    }
+                } else if marker == 0xE2 && payload.starts_with(b"ICC_PROFILE\0") {
+                    meta.has_icc = true;
+                }
+                pos += seg_len;
             }
         }
         ImageFormat::Png => {
-            // PNG chunks: eXIf, iCCP, XML:com.adobe.xmp
-            if bytes.windows(4).any(|w| w == b"eXIf") {
-                meta.has_exif = true;
+            if bytes.len() < 8 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+                return meta;
             }
-            if bytes.windows(4).any(|w| w == b"iCCP") {
-                meta.has_icc = true;
-            }
-            if bytes
-                .windows(4)
-                .any(|w| w == b"iTXt" || w == b"tEXt" || w == b"zTXt")
-                && bytes
-                    .windows(28)
-                    .any(|w| w == b"http://ns.adobe.com/xap/1.0/")
-            {
-                meta.has_xmp = true;
+            let mut pos = 8usize;
+            while pos + 12 <= bytes.len() {
+                let len = u32::from_be_bytes([
+                    bytes[pos],
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                ]) as usize;
+                let chunk_type = &bytes[pos + 4..pos + 8];
+                let data_start = pos + 8;
+                let Some(data_end) = data_start.checked_add(len) else {
+                    break;
+                };
+                let Some(next_pos) = data_end.checked_add(4) else {
+                    break;
+                };
+                if next_pos > bytes.len() {
+                    break;
+                }
+                let payload = &bytes[data_start..data_end];
+                match chunk_type {
+                    b"eXIf" => meta.has_exif = true,
+                    b"iCCP" => meta.has_icc = true,
+                    b"iTXt" | b"tEXt" | b"zTXt" => {
+                        if payload.starts_with(b"XML:com.adobe.xmp\0")
+                            || payload
+                                .windows(28)
+                                .any(|w| w == b"http://ns.adobe.com/xap/1.0/")
+                        {
+                            meta.has_xmp = true;
+                        }
+                    }
+                    b"IEND" => break,
+                    _ => {}
+                }
+                pos = next_pos;
             }
         }
         ImageFormat::Webp => {
-            // WebP chunks: EXIF, ICCP, XMP
-            if bytes.windows(4).any(|w| w == b"EXIF") {
-                meta.has_exif = true;
+            if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+                return meta;
             }
-            if bytes.windows(4).any(|w| w == b"ICCP") {
-                meta.has_icc = true;
-            }
-            if bytes.windows(4).any(|w| w == b"XMP ") {
-                meta.has_xmp = true;
+            let mut pos = 12usize;
+            while pos + 8 <= bytes.len() {
+                let fourcc = &bytes[pos..pos + 4];
+                let len = u32::from_le_bytes([
+                    bytes[pos + 4],
+                    bytes[pos + 5],
+                    bytes[pos + 6],
+                    bytes[pos + 7],
+                ]) as usize;
+                match fourcc {
+                    b"EXIF" => meta.has_exif = true,
+                    b"ICCP" => meta.has_icc = true,
+                    b"XMP " => meta.has_xmp = true,
+                    _ => {}
+                }
+                let padded = len.saturating_add(len & 1);
+                let Some(next_pos) = pos.checked_add(8).and_then(|p| p.checked_add(padded)) else {
+                    break;
+                };
+                pos = next_pos;
             }
         }
     }
@@ -226,7 +381,6 @@ fn inspect_characteristics(raw: &RawImage) -> ImageCharacteristics {
         }
     }
 
-    // Estimate Shannon entropy across raw sample
     let entropy_hint = calculate_entropy(&raw.data);
 
     ImageCharacteristics {
@@ -275,7 +429,7 @@ mod tests {
         let codec = PngCodec;
         let mut rgba = vec![255, 0, 0, 255, 0, 255, 0, 255];
         if transparent {
-            rgba[7] = 120; // translucent pixel
+            rgba[7] = 120;
         }
         let pixels = DecodedPixels::new(2, 1, PixelFormat::Rgba8, rgba);
         codec

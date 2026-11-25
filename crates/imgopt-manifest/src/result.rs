@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 
@@ -90,7 +90,6 @@ impl RunResult {
                 }
                 RunItemStatus::Skipped => {
                     skipped_files += 1;
-                    // For skipped files, output size equals source size or cached size
                     if let Some(opt_b) = item.optimized_bytes {
                         optimized_bytes += opt_b;
                     } else {
@@ -99,15 +98,14 @@ impl RunResult {
                 }
                 RunItemStatus::Failed => {
                     failed_files += 1;
-                    // Failed files do not contribute to optimized bytes
                 }
             }
         }
 
         let saved_bytes = if original_bytes >= optimized_bytes {
-            (original_bytes - optimized_bytes) as i64
+            i64::try_from(original_bytes - optimized_bytes).unwrap_or(i64::MAX)
         } else {
-            -((optimized_bytes - original_bytes) as i64)
+            -i64::try_from(optimized_bytes - original_bytes).unwrap_or(i64::MAX)
         };
 
         let saved_ratio = if original_bytes > 0 && saved_bytes > 0 {
@@ -134,38 +132,28 @@ impl RunResult {
         serde_json::to_string_pretty(self)
     }
 
-    /// Write this run result to the destination path atomically.
+    /// Write this run result to the destination path atomically via exclusive temp file.
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let dest = path.as_ref();
-        let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+        let parent = match dest.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
         if !parent.exists() {
             fs::create_dir_all(parent)?;
         }
 
-        let tmp_path = parent.join(format!(
-            ".tmp-result-{}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-
         let json_bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        let res = (|| -> std::io::Result<()> {
-            let mut file = File::create(&tmp_path)?;
-            file.write_all(&json_bytes)?;
-            file.sync_all()?;
-            fs::rename(&tmp_path, dest)?;
-            Ok(())
-        })();
-
-        if res.is_err() && tmp_path.exists() {
-            let _ = fs::remove_file(&tmp_path);
-        }
-
-        res
+        let mut tmp_file = tempfile::Builder::new()
+            .prefix(".tmp-result-")
+            .suffix(".json")
+            .tempfile_in(parent)?;
+        tmp_file.write_all(&json_bytes)?;
+        tmp_file.as_file().sync_all()?;
+        tmp_file.persist(dest).map_err(|e| e.error)?;
+        Ok(())
     }
 }
 
@@ -218,7 +206,7 @@ mod tests {
         assert_eq!(result.summary.skipped_files, 1);
         assert_eq!(result.summary.failed_files, 1);
         assert_eq!(result.summary.original_bytes, 1700);
-        assert_eq!(result.summary.optimized_bytes, 1000); // 600 + 400
+        assert_eq!(result.summary.optimized_bytes, 1000);
         assert_eq!(result.summary.saved_bytes, 700);
         assert!((result.summary.saved_ratio - (700.0 / 1700.0)).abs() < 1e-6);
         assert_eq!(result.summary.elapsed_millis, 150);

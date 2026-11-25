@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::analyzer::ResourceLimits;
+use crate::analyzer::{probe_metadata_markers, ResourceLimits};
 use crate::config::MetadataPolicy;
 use crate::detect::detect_format;
 use crate::error::{ErrorKind, ImgoptError, PipelineStage, Result};
@@ -39,7 +39,7 @@ pub struct ValidatedOutput {
     pub savings_ratio: f64,
 }
 
-/// Validate candidate bytes against integrity, dimensional, and format invariants.
+/// Validate candidate bytes against integrity, dimensional, metadata, and format invariants.
 pub fn validate_candidate_output(
     candidate_bytes: &[u8],
     original_size: u64,
@@ -77,7 +77,6 @@ pub fn validate_candidate_output(
         }
     }
 
-    // Verify format detection from output bytes
     let detected_format = detect_format(candidate_bytes).map_err(|e| {
         ImgoptError::new(
             PipelineStage::OutputValidation,
@@ -98,14 +97,45 @@ pub fn validate_candidate_output(
         ));
     }
 
-    // Decode output bytes to verify decodability and check dimensions
-    let codec = imgopt_codecs::codec_for_format(criteria.expected_format.into());
-    let decoded = codec.decode(candidate_bytes).map_err(|e| {
-        ImgoptError::new(
+    // Enforce metadata stripping policy on output container bytes
+    let out_meta = probe_metadata_markers(candidate_bytes, detected_format);
+    if !criteria.metadata_policy.preserves_exif() && out_meta.has_exif {
+        return Err(ImgoptError::new(
             PipelineStage::OutputValidation,
-            ErrorKind::Decode(format!("corrupt candidate bytes failed to decode: {e}")),
-        )
-    })?;
+            ErrorKind::InvalidInput(
+                "candidate output unexpectedly contains EXIF metadata under strip policy".into(),
+            ),
+        ));
+    }
+    if !criteria.metadata_policy.preserves_icc() && out_meta.has_icc {
+        return Err(ImgoptError::new(
+            PipelineStage::OutputValidation,
+            ErrorKind::InvalidInput(
+                "candidate output unexpectedly contains ICC profile under strip policy".into(),
+            ),
+        ));
+    }
+    if !criteria.metadata_policy.preserves_xmp() && out_meta.has_xmp {
+        return Err(ImgoptError::new(
+            PipelineStage::OutputValidation,
+            ErrorKind::InvalidInput(
+                "candidate output unexpectedly contains XMP metadata under strip policy".into(),
+            ),
+        ));
+    }
+
+    let codec = imgopt_codecs::codec_for_format(criteria.expected_format.into());
+    let decode_limits = limits
+        .map(ResourceLimits::to_decode_limits)
+        .unwrap_or_default();
+    let decoded = codec
+        .decode_with_limits(candidate_bytes, &decode_limits)
+        .map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::OutputValidation,
+                ErrorKind::Decode(format!("corrupt candidate bytes failed to decode: {e}")),
+            )
+        })?;
 
     if decoded.width != criteria.expected_dimensions.width
         || decoded.height != criteria.expected_dimensions.height
@@ -122,7 +152,11 @@ pub fn validate_candidate_output(
         ));
     }
 
-    let savings_bytes = (original_size as i64) - (cand_size as i64);
+    let savings_bytes = if original_size >= cand_size {
+        i64::try_from(original_size - cand_size).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(cand_size - original_size).unwrap_or(i64::MAX)
+    };
     let savings_ratio = if original_size > 0 {
         savings_bytes as f64 / original_size as f64
     } else {

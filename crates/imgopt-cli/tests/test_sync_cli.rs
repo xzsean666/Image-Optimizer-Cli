@@ -91,9 +91,27 @@ fn test_sync_cli_missing_storage_config_fails() {
     let status = Command::new(bin_path)
         .env_remove("IMGOPT_S3_BUCKET")
         .env_remove("AWS_S3_BUCKET")
+        .env_remove("IMGOPT_S3_ACCESS_KEY_ID")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("IMGOPT_S3_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
         .args(["sync", input_dir.to_str().unwrap()])
         .status()
         .unwrap();
 
     assert!(!status.success());
+
+    // Passing --bucket without credentials must still fail (no silent "anonymous" fallback)
+    let status_bucket_only = Command::new(bin_path)
+        .env_remove("IMGOPT_S3_BUCKET")
+        .env_remove("AWS_S3_BUCKET")
+        .env_remove("IMGOPT_S3_ACCESS_KEY_ID")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("IMGOPT_S3_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .args(["sync", input_dir.to_str().unwrap(), "--bucket", "my-bucket"])
+        .status()
+        .unwrap();
+
+    assert!(!status_bucket_only.success());
 }

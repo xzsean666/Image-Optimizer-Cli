@@ -186,6 +186,10 @@ impl From<imgopt_codecs::CodecError> for ImgoptError {
             imgopt_codecs::CodecError::InvalidParameter(msg) => {
                 Self::new(PipelineStage::Config, ErrorKind::Configuration(msg))
             }
+            imgopt_codecs::CodecError::ResourceLimitExceeded(msg) => Self::new(
+                PipelineStage::ResourceCheck,
+                ErrorKind::ResourceLimitExceeded(msg),
+            ),
             imgopt_codecs::CodecError::Io(msg) => {
                 Self::new(PipelineStage::Discovery, ErrorKind::Io(msg))
             }

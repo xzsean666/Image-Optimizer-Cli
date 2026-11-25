@@ -58,6 +58,7 @@ pub enum CodecError {
     EncodeError(String),
     UnsupportedFormat(String),
     InvalidParameter(String),
+    ResourceLimitExceeded(String),
     Io(String),
 }
 
@@ -68,12 +69,63 @@ impl fmt::Display for CodecError {
             Self::EncodeError(msg) => write!(f, "encode error: {msg}"),
             Self::UnsupportedFormat(msg) => write!(f, "unsupported format: {msg}"),
             Self::InvalidParameter(msg) => write!(f, "invalid parameter: {msg}"),
+            Self::ResourceLimitExceeded(msg) => write!(f, "resource limit exceeded: {msg}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for CodecError {}
+
+/// Resource limits enforced before and during image decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
+    pub max_pixels: Option<u64>,
+    pub max_alloc_bytes: Option<u64>,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_width: Some(16_384),
+            max_height: Some(16_384),
+            max_pixels: Some(64 * 1024 * 1024),
+            max_alloc_bytes: Some(512 * 1024 * 1024),
+        }
+    }
+}
+
+/// Extracted metadata payloads from a decoded image container.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageMetadataChunks {
+    pub icc_profile: Option<Vec<u8>>,
+    pub exif: Option<Vec<u8>>,
+    pub xmp: Option<Vec<u8>>,
+}
+
+impl ImageMetadataChunks {
+    pub fn is_empty(&self) -> bool {
+        self.icc_profile.as_ref().is_none_or(|b| b.is_empty())
+            && self.exif.as_ref().is_none_or(|b| b.is_empty())
+            && self.xmp.as_ref().is_none_or(|b| b.is_empty())
+    }
+}
+
+/// Fine-grained metadata preservation flags passed to encoders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataPreservation {
+    pub preserve_exif: bool,
+    pub preserve_icc: bool,
+    pub preserve_xmp: bool,
+}
+
+impl MetadataPreservation {
+    pub const fn any(&self) -> bool {
+        self.preserve_exif || self.preserve_icc || self.preserve_xmp
+    }
+}
 
 /// Decoded pixel buffer with metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +134,7 @@ pub struct DecodedPixels {
     pub height: u32,
     pub pixel_format: PixelFormat,
     pub data: Vec<u8>,
+    pub metadata: ImageMetadataChunks,
 }
 
 impl DecodedPixels {
@@ -91,15 +144,40 @@ impl DecodedPixels {
             height,
             pixel_format,
             data,
+            metadata: ImageMetadataChunks::default(),
+        }
+    }
+
+    pub fn with_metadata(
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+        data: Vec<u8>,
+        metadata: ImageMetadataChunks,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format,
+            data,
+            metadata,
         }
     }
 
     pub fn expected_byte_len(&self) -> usize {
-        (self.width as usize) * (self.height as usize) * self.pixel_format.bytes_per_pixel()
+        (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(self.pixel_format.bytes_per_pixel())
     }
 
     pub fn is_valid(&self) -> bool {
-        self.data.len() == self.expected_byte_len()
+        let Some(expected) = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|px| px.checked_mul(self.pixel_format.bytes_per_pixel()))
+        else {
+            return false;
+        };
+        self.data.len() == expected
     }
 }
 
@@ -110,6 +188,7 @@ pub struct EncodeOptions {
     pub effort: u8,
     pub lossless: bool,
     pub preserve_metadata: bool,
+    pub metadata_preservation: MetadataPreservation,
 }
 
 impl Default for EncodeOptions {
@@ -119,6 +198,23 @@ impl Default for EncodeOptions {
             effort: 4,
             lossless: false,
             preserve_metadata: false,
+            metadata_preservation: MetadataPreservation::default(),
+        }
+    }
+}
+
+impl EncodeOptions {
+    /// Effective per-chunk metadata preservation flags, honoring both `preserve_metadata`
+    /// and granular `metadata_preservation`.
+    pub const fn effective_preservation(&self) -> MetadataPreservation {
+        if self.preserve_metadata {
+            MetadataPreservation {
+                preserve_exif: true,
+                preserve_icc: true,
+                preserve_xmp: true,
+            }
+        } else {
+            self.metadata_preservation
         }
     }
 }
@@ -146,11 +242,56 @@ pub struct CodecCapabilities {
 pub trait ImageCodec: Send + Sync {
     fn capabilities(&self) -> CodecCapabilities;
     fn decode(&self, input_bytes: &[u8]) -> Result<DecodedPixels, CodecError>;
+    fn decode_with_limits(
+        &self,
+        input_bytes: &[u8],
+        limits: &DecodeLimits,
+    ) -> Result<DecodedPixels, CodecError> {
+        let decoded = self.decode(input_bytes)?;
+        check_dimensions_against_limits(decoded.width, decoded.height, limits)?;
+        Ok(decoded)
+    }
     fn encode(
         &self,
         pixels: &DecodedPixels,
         options: &EncodeOptions,
     ) -> Result<EncodedOutput, CodecError>;
+}
+
+/// Validate image dimensions against configured `DecodeLimits`.
+pub fn check_dimensions_against_limits(
+    width: u32,
+    height: u32,
+    limits: &DecodeLimits,
+) -> Result<(), CodecError> {
+    if width == 0 || height == 0 {
+        return Err(CodecError::DecodeError(
+            "image dimensions cannot be zero".into(),
+        ));
+    }
+    if let Some(max_w) = limits.max_width {
+        if width > max_w {
+            return Err(CodecError::ResourceLimitExceeded(format!(
+                "image width {width} exceeds configured limit of {max_w} pixels"
+            )));
+        }
+    }
+    if let Some(max_h) = limits.max_height {
+        if height > max_h {
+            return Err(CodecError::ResourceLimitExceeded(format!(
+                "image height {height} exceeds configured limit of {max_h} pixels"
+            )));
+        }
+    }
+    let pixel_count = u64::from(width) * u64::from(height);
+    if let Some(max_px) = limits.max_pixels {
+        if pixel_count > max_px {
+            return Err(CodecError::ResourceLimitExceeded(format!(
+                "pixel count {pixel_count} exceeds configured limit of {max_px} pixels"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Fake codec implementation for unit testing and interface contract validation.
@@ -188,7 +329,6 @@ impl ImageCodec for FakeCodec {
         if input_bytes.is_empty() {
             return Err(CodecError::DecodeError("empty input bytes".into()));
         }
-        // Return a mock 2x2 RGB image
         Ok(DecodedPixels::new(2, 2, PixelFormat::Rgb8, vec![255; 12]))
     }
 
@@ -205,7 +345,6 @@ impl ImageCodec for FakeCodec {
                 "invalid pixel buffer length".into(),
             ));
         }
-        // Produce simulated output bytes
         let mut bytes =
             format!("FAKE-{}-Q{}", self.capabilities.format, options.quality).into_bytes();
         bytes.extend_from_slice(&pixels.data);
@@ -239,6 +378,7 @@ mod tests {
             effort: 5,
             lossless: false,
             preserve_metadata: false,
+            ..Default::default()
         };
 
         let encoded = codec.encode(&decoded, &options).unwrap();

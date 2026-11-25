@@ -1,9 +1,9 @@
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::interface::{ObjectStorage, StorageError, UploadRequest};
 
-/// Configuration for upload retries with exponential backoff.
+/// Configuration for upload retries with exponential backoff and jitter.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
     pub max_attempts: usize,
@@ -34,7 +34,18 @@ pub struct VerifiedUploadResult {
     pub verified: bool,
 }
 
-/// Upload an object with bounded retries and post-upload verification.
+fn jitter_millis(max_jitter: u64) -> u64 {
+    if max_jitter == 0 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % (max_jitter + 1)
+}
+
+/// Upload an object with bounded retries and strict post-upload verification.
 pub fn upload_and_verify<S: ObjectStorage>(
     storage: &S,
     request: &UploadRequest,
@@ -47,7 +58,7 @@ pub fn upload_and_verify<S: ObjectStorage>(
     for attempt in 1..=max_attempts {
         match storage.put_object(request) {
             Ok(upload_resp) => {
-                // Post-upload verification: check object exists and matches size
+                // Post-upload verification: object MUST exist and match byte size (and ETag if available)
                 match storage.head_object(&request.bucket, &request.object_key) {
                     Ok(Some(meta)) => {
                         let expected_size = request.body.len() as u64;
@@ -56,6 +67,22 @@ pub fn upload_and_verify<S: ObjectStorage>(
                                 expected: format!("{expected_size} bytes"),
                                 actual: format!("{} bytes", meta.byte_size),
                             });
+                        }
+
+                        if let (Some(ref put_etag), Some(ref head_etag)) =
+                            (&upload_resp.etag, &meta.etag)
+                        {
+                            let norm_put = put_etag.trim_matches('"');
+                            let norm_head = head_etag.trim_matches('"');
+                            if !norm_put.is_empty()
+                                && !norm_head.is_empty()
+                                && norm_put != norm_head
+                            {
+                                return Err(StorageError::ChecksumMismatch {
+                                    expected: norm_put.to_string(),
+                                    actual: norm_head.to_string(),
+                                });
+                            }
                         }
 
                         return Ok(VerifiedUploadResult {
@@ -68,22 +95,21 @@ pub fn upload_and_verify<S: ObjectStorage>(
                         });
                     }
                     Ok(None) => {
-                        // In some implementations (like standard S3Client placeholder), head may return None.
-                        // We still produce verified upload with the put response size.
-                        return Ok(VerifiedUploadResult {
-                            bucket: upload_resp.bucket,
-                            object_key: upload_resp.object_key,
-                            byte_size: upload_resp.byte_size,
-                            etag: upload_resp.etag,
-                            attempts_used: attempt,
-                            verified: true,
-                        });
+                        let missing_err = StorageError::NotFound {
+                            bucket: request.bucket.clone(),
+                            object_key: request.object_key.clone(),
+                        };
+                        last_error = missing_err;
+                        if attempt == max_attempts {
+                            return Err(last_error);
+                        }
                     }
                     Err(e) => {
-                        if !e.is_retryable() || attempt == max_attempts {
-                            return Err(e);
-                        }
+                        let is_retryable = e.is_retryable();
                         last_error = e;
+                        if !is_retryable || attempt == max_attempts {
+                            return Err(last_error);
+                        }
                     }
                 }
             }
@@ -97,8 +123,8 @@ pub fn upload_and_verify<S: ObjectStorage>(
             }
         }
 
-        // Sleep before retry
-        thread::sleep(Duration::from_millis(backoff));
+        let jitter = jitter_millis(backoff / 4);
+        thread::sleep(Duration::from_millis(backoff.saturating_add(jitter)));
         backoff = ((backoff as f64) * retry_policy.backoff_multiplier) as u64;
         backoff = backoff.min(retry_policy.max_backoff_millis);
     }
@@ -109,7 +135,33 @@ pub fn upload_and_verify<S: ObjectStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interface::MemoryObjectStorage;
+    use crate::interface::{MemoryObjectStorage, ObjectMetadata, UploadResponse};
+
+    struct VanishingStorage;
+
+    impl ObjectStorage for VanishingStorage {
+        fn put_object(&self, req: &UploadRequest) -> Result<UploadResponse, StorageError> {
+            Ok(UploadResponse {
+                bucket: req.bucket.clone(),
+                object_key: req.object_key.clone(),
+                etag: Some("etag".into()),
+                byte_size: req.body.len() as u64,
+            })
+        }
+
+        fn head_object(
+            &self,
+            _bucket: &str,
+            _object_key: &str,
+        ) -> Result<Option<ObjectMetadata>, StorageError> {
+            // Simulates missing object (404) after PUT
+            Ok(None)
+        }
+
+        fn delete_object(&self, _bucket: &str, _object_key: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_immediate_success() {
@@ -121,6 +173,21 @@ mod tests {
         assert_eq!(res.attempts_used, 1);
         assert!(res.verified);
         assert_eq!(res.byte_size, 3);
+    }
+
+    #[test]
+    fn test_missing_object_after_put_fails_verification() {
+        let storage = VanishingStorage;
+        let req = UploadRequest::new("bucket", "missing.webp", vec![1, 2, 3], "image/webp");
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            initial_backoff_millis: 1,
+            max_backoff_millis: 2,
+            backoff_multiplier: 1.0,
+        };
+
+        let res = upload_and_verify(&storage, &req, &policy);
+        assert!(matches!(res, Err(StorageError::NotFound { .. })));
     }
 
     #[test]
