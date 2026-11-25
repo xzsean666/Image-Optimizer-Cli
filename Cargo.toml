@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/imgopt",
     "crates/imgopt-cli",
     "crates/imgopt-codecs",
     "crates/imgopt-core",

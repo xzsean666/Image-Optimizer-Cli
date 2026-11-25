@@ -76,7 +76,10 @@ pub fn build_public_url(public_url_base: &str, object_key: &str) -> Result<Strin
         ));
     }
 
-    if base.chars().any(|c| c.is_ascii_control() || matches!(c, '?' | '#')) {
+    if base
+        .chars()
+        .any(|c| c.is_ascii_control() || matches!(c, '?' | '#'))
+    {
         return Err(StorageError::InvalidParameter(
             "public_url_base contains invalid characters".into(),
         ));

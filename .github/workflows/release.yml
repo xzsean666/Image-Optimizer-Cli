@@ -1,13 +1,10 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0)"
+        description: "Release tag (e.g. v0.1.1)"
         required: true
         default: "v0.1.0"
 
@@ -18,7 +15,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
+  build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -35,7 +32,7 @@ jobs:
             asset_name: imgopt-linux-aarch64.tar.gz
             use_cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             artifact_name: imgopt
             asset_name: imgopt-macos-x86_64.tar.gz
           - target: aarch64-apple-darwin
@@ -63,14 +60,14 @@ jobs:
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@cross
 
-      - name: Build binary
+      - name: Build CLI binary
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release --locked -p imgopt-cli --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --locked -p imgopt-cli --target ${{ matrix.target }}
           fi
         shell: bash
 
@@ -87,9 +84,10 @@ jobs:
       - name: Package Artifacts (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          mkdir staging
+          mkdir -p staging
           cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} staging/
           cp README.md staging/
+          cp docs/USER_GUIDE.md staging/ 2>/dev/null || true
           7z a -tzip ${{ matrix.asset_name }} ./staging/*
         shell: bash
 
@@ -104,12 +102,31 @@ jobs:
           fi
         shell: bash
 
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v2
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: dist-${{ matrix.target }}
+          path: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: artifacts/*
           generate_release_notes: true
           draft: false
           prerelease: false

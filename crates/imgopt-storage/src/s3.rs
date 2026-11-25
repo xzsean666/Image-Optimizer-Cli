@@ -78,12 +78,7 @@ fn map_transport_error(err: ureq::Transport) -> StorageError {
     }
 }
 
-fn map_http_status_error(
-    code: u16,
-    body: String,
-    bucket: &str,
-    object_key: &str,
-) -> StorageError {
+fn map_http_status_error(code: u16, body: String, bucket: &str, object_key: &str) -> StorageError {
     match code {
         401 => StorageError::AuthenticationFailed(format!("HTTP 401 Unauthorized: {body}")),
         403 => StorageError::AccessDenied(format!("HTTP 403 Access Denied: {body}")),
@@ -92,9 +87,7 @@ fn map_http_status_error(
             object_key: object_key.to_string(),
         },
         408 => StorageError::Timeout(format!("HTTP 408 Request Timeout: {body}")),
-        429 | 500..=599 => {
-            StorageError::ServerError(format!("HTTP {code} Server Error: {body}"))
-        }
+        429 | 500..=599 => StorageError::ServerError(format!("HTTP {code} Server Error: {body}")),
         _ => StorageError::InvalidParameter(format!("HTTP {code} Error: {body}")),
     }
 }
@@ -516,10 +509,7 @@ mod tests {
 
     #[test]
     fn test_sigv4_uri_encoding_and_presigned_url() {
-        assert_eq!(
-            sigv4_uri_encode("a+b/c d~e@1", false),
-            "a%2Bb/c%20d~e%401"
-        );
+        assert_eq!(sigv4_uri_encode("a+b/c d~e@1", false), "a%2Bb/c%20d~e%401");
         let config = S3StorageConfig {
             bucket: "my-bucket".into(),
             region: "us-east-1".into(),

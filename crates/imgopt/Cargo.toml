@@ -1,0 +1,23 @@
+[package]
+name = "imgopt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust image optimization engine (JPEG, PNG, WebP) with SSIM/PSNR quality targets, manifest deduplication, and S3-compatible sync"
+repository = "https://github.com/xzsean666/Image-Optimizer-Cli"
+
+[features]
+default = []
+manifest = ["dep:imgopt-manifest"]
+storage = ["dep:imgopt-storage"]
+full = ["manifest", "storage"]
+
+[dependencies]
+imgopt-codecs = { path = "../imgopt-codecs" }
+imgopt-core = { path = "../imgopt-core" }
+imgopt-manifest = { path = "../imgopt-manifest", optional = true }
+imgopt-quality = { path = "../imgopt-quality" }
+imgopt-storage = { path = "../imgopt-storage", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
