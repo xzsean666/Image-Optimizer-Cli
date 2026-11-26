@@ -217,7 +217,7 @@ imgopt --env-file .env.prod sync ./photos \
   --json sync-report.json \
   --fail-on-error
 ```
-> 💡 **CI/CD 一键自动化模板**：如果你有一个专门存放素材的仓库，希望上传图片后由 GitHub Actions 自动优化同步到 R2/S3 并直接输出可复制的 CDN 链接，可参考即用模板 [`docs/examples/sync-r2-s3.yml`](docs/examples/sync-r2-s3.yml)。
+> 💡 **CI/CD 一键自动化模板**：如果你有一个专门存放素材的仓库，希望上传图片后由 GitHub Actions 自动优化同步到 R2/S3 并直接输出可复制的 CDN 链接，可参考即用模板 [`docs/examples/sync-r2-s3.yml`](docs/examples/sync-r2-s3.yml)；如需同时生成**高压缩主图 + 极小缩略图 Icon**双版本，可直接使用 [`docs/examples/sync-r2-s3-with-icons.yml`](docs/examples/sync-r2-s3-with-icons.yml)。
 
 ### 3. 图像探查（`inspect`）
 只读分析格式（含动图与帧数）、分辨率、色彩通道、透明通道、灰度特征、信息熵及 EXIF/ICC/XMP 元数据：
@@ -274,7 +274,7 @@ imgopt benchmark ./dataset --preset maximum --format auto --json benchmark_repor
 | `--prefix` | `IMGOPT_S3_KEY_PREFIX` / `IMGOPT_S3_PREFIX` | — | 远程对象键前缀 |
 | `--public-url-base` | `IMGOPT_PUBLIC_URL_BASE` / `IMGOPT_S3_PUBLIC_URL_BASE` | — | 公开 CDN 基础域名 |
 | `--cache-control` | `IMGOPT_S3_CACHE_CONTROL` | `public, max-age=31536000, immutable` | 上传对象的 `Cache-Control` 响应头 |
-| `--key-mode` | — | `content` | `sync` 对象键模式：`content`（`images/{sha}/optimized.{ext}`）或 `variant`（含配置哈希，适配参数变更与 `immutable` 缓存） |
+| `--key-mode` | — | `content` | `sync` 对象键模式：`content`（`images/{sha}/optimized.{ext}`）、`variant`（含配置哈希，适配 `immutable` 缓存）或 `path`（保留相对目录与原文件名：`{prefix}/{rel_dir}/{stem}.{ext}`） |
 | `--urls-json` | — | — | `sync` 导出的 `相对路径 -> CDN URL` 扁平映射 JSON 文件路径 |
 | `--preset` | — | `balanced` | 优化预设：`balanced`、`maximum`、`aggressive` |
 | `--quality` / `-q` | — | 随预设 | 目标 SSIM 画质分数（`0.0` ~ `1.0`） |

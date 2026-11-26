@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use imgopt_core::{
     hash_bytes, utc_now_rfc3339, ErrorKind, ImageFormat, ImgoptError, OptimizationResult,
     PipelineStage, Result as CoreResult, StorageErrorKind, SyncStorage, SyncStorageOutput,
@@ -5,7 +7,9 @@ use imgopt_core::{
 
 use crate::interface::{ObjectStorage, StorageError, UploadRequest};
 use crate::upload::{upload_and_verify, RetryPolicy};
-use crate::url::{build_public_url, derive_object_key_for_mode, ObjectKeyMode};
+use crate::url::{
+    build_public_url, derive_object_key_for_mode, derive_path_object_key, ObjectKeyMode,
+};
 
 /// Type alias for dynamic presigned URL generator functions.
 pub type PresignedUrlGenerator = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
@@ -164,6 +168,35 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
                 imgopt_core::ErrorKind::InvalidInput(e.to_string()),
             )
         })
+    }
+
+    fn derive_object_key_for_path(
+        &self,
+        source_sha256: &str,
+        optimization_key: &str,
+        relative_path: Option<&Path>,
+        format: ImageFormat,
+    ) -> CoreResult<String> {
+        if self.key_mode == ObjectKeyMode::Path {
+            let rel = relative_path.ok_or_else(|| {
+                ImgoptError::new(
+                    PipelineStage::StorageUpload,
+                    imgopt_core::ErrorKind::InvalidInput(
+                        "relative_path is required when ObjectKeyMode::Path is enabled".into(),
+                    ),
+                )
+            })?;
+            derive_path_object_key(self.key_prefix.as_deref(), rel, format.extension()).map_err(
+                |e| {
+                    ImgoptError::new(
+                        PipelineStage::StorageUpload,
+                        imgopt_core::ErrorKind::InvalidInput(e.to_string()),
+                    )
+                },
+            )
+        } else {
+            self.derive_object_key_for_optimization(source_sha256, optimization_key, format)
+        }
     }
 
     fn build_public_url(&self, object_key: &str) -> Option<String> {

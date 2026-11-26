@@ -399,3 +399,108 @@ fn test_gc_cli_refuses_empty_manifest_delete_by_default() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn test_sync_cli_path_key_mode_preserves_folders_and_filenames() {
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("projectA");
+    let nested = input_dir.join("ui/buttons");
+    fs::create_dir_all(&nested).unwrap();
+
+    // Two distinct paths with identical pixels (identical SHA-256) must both upload to their own paths
+    make_png(&input_dir.join("logo.png"), 24, 24);
+    make_png(&nested.join("save.png"), 24, 24);
+
+    let manifest_path = temp.path().join("manifest_path.json");
+    let urls_json_path = temp.path().join("urls_path.json");
+    let bin_path = env!("CARGO_BIN_EXE_imgopt");
+
+    let run1 = Command::new(bin_path)
+        .args([
+            "sync",
+            input_dir.to_str().unwrap(),
+            "--dry-run",
+            "--prefix",
+            "projectA/full",
+            "--format",
+            "force-webp",
+            "--key-mode",
+            "path",
+            "--preset",
+            "balanced",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--urls-json",
+            urls_json_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run1.stderr)
+    );
+
+    let urls1: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&urls_json_path).unwrap()).unwrap();
+    assert_eq!(
+        urls1["logo.png"].as_str(),
+        Some("https://dry-run.local/projectA/full/logo.webp")
+    );
+    assert_eq!(
+        urls1["ui/buttons/save.png"].as_str(),
+        Some("https://dry-run.local/projectA/full/ui/buttons/save.webp")
+    );
+
+    // 2nd run with unchanged files skips both from path_entries cache and keeps URLs
+    let run2 = Command::new(bin_path)
+        .args([
+            "sync",
+            input_dir.to_str().unwrap(),
+            "--dry-run",
+            "--prefix",
+            "projectA/full",
+            "--format",
+            "force-webp",
+            "--key-mode",
+            "path",
+            "--preset",
+            "balanced",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--urls-json",
+            urls_json_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(run2.status.success());
+    let stdout2 = String::from_utf8_lossy(&run2.stdout);
+    assert!(stdout2.contains("Skipped (cached): 2"), "stdout: {stdout2}");
+
+    // Modify logo.png -> only logo.png reprocesses while save.png stays cached
+    make_png(&input_dir.join("logo.png"), 32, 32);
+    let run3 = Command::new(bin_path)
+        .args([
+            "sync",
+            input_dir.to_str().unwrap(),
+            "--dry-run",
+            "--prefix",
+            "projectA/full",
+            "--format",
+            "force-webp",
+            "--key-mode",
+            "path",
+            "--preset",
+            "balanced",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--urls-json",
+            urls_json_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(run3.status.success());
+    let stdout3 = String::from_utf8_lossy(&run3.stdout);
+    assert!(stdout3.contains("Optimized:        1"), "stdout: {stdout3}");
+    assert!(stdout3.contains("Skipped (cached): 1"), "stdout: {stdout3}");
+}

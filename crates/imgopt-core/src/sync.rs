@@ -55,6 +55,15 @@ pub trait SyncStorage: Send + Sync {
     ) -> Result<String> {
         self.derive_object_key(source_sha256, format)
     }
+    fn derive_object_key_for_path(
+        &self,
+        source_sha256: &str,
+        optimization_key: &str,
+        _relative_path: Option<&Path>,
+        format: ImageFormat,
+    ) -> Result<String> {
+        self.derive_object_key_for_optimization(source_sha256, optimization_key, format)
+    }
     fn build_public_url(&self, object_key: &str) -> Option<String>;
 }
 
@@ -135,6 +144,8 @@ struct PendingAssetWork {
     source_sha: Sha256Digest,
     sha_hex: String,
     byte_size: u64,
+    relative_path: Option<PathBuf>,
+    dedup_key: String,
 }
 
 struct IntraBatchDup {
@@ -143,6 +154,7 @@ struct IntraBatchDup {
     source_sha: Sha256Digest,
     sha_hex: String,
     byte_size: u64,
+    dedup_key: String,
 }
 
 enum WorkerOutcome {
@@ -150,6 +162,7 @@ enum WorkerOutcome {
         item_index: usize,
         source_sha: Sha256Digest,
         byte_size: u64,
+        dedup_key: String,
         opt_res: Box<OptimizationResult>,
         storage_out: SyncStorageOutput,
     },
@@ -158,6 +171,7 @@ enum WorkerOutcome {
         source_sha: Sha256Digest,
         sha_hex: String,
         byte_size: u64,
+        dedup_key: String,
         error: String,
     },
 }
@@ -420,6 +434,16 @@ impl SyncService {
                 _ => detected_fmt,
             };
 
+            let relative_path: Option<PathBuf> = if input_path.is_dir() {
+                discovered
+                    .path
+                    .strip_prefix(input_path)
+                    .ok()
+                    .map(Path::to_path_buf)
+            } else {
+                discovered.path.file_name().map(PathBuf::from)
+            };
+
             let opt_key = OptimizationKey::compute(
                 &source_sha,
                 self.optimizer.optimizer_version(),
@@ -427,7 +451,12 @@ impl SyncService {
                 config,
             );
             let expected_obj_key = storage
-                .derive_object_key_for_optimization(&sha_str, opt_key.as_str(), expected_format)
+                .derive_object_key_for_path(
+                    &sha_str,
+                    opt_key.as_str(),
+                    relative_path.as_deref(),
+                    expected_format,
+                )
                 .ok();
 
             let mut matched_opt_key = opt_key.clone();
@@ -456,7 +485,12 @@ impl SyncService {
                     config,
                 );
                 let alt_obj_key = storage
-                    .derive_object_key_for_optimization(&sha_str, alt_opt_key.as_str(), alt_fmt)
+                    .derive_object_key_for_path(
+                        &sha_str,
+                        alt_opt_key.as_str(),
+                        relative_path.as_deref(),
+                        alt_fmt,
+                    )
                     .ok();
                 let alt_action = manifest.evaluate_for_target(
                     &sha_str,
@@ -471,6 +505,8 @@ impl SyncService {
                 }
             }
 
+            let dedup_key = format!("{sha_str}:{}", expected_obj_key.as_deref().unwrap_or(""));
+
             match action {
                 SyncPlanAction::SkipUpToDate {
                     storage_url,
@@ -482,9 +518,10 @@ impl SyncService {
                     skipped_count += 1;
                     total_optimized += optimized_bytes;
                     let resolved_url = storage
-                        .derive_object_key_for_optimization(
+                        .derive_object_key_for_path(
                             &sha_str,
                             matched_opt_key.as_str(),
+                            relative_path.as_deref(),
                             format,
                         )
                         .ok()
@@ -503,16 +540,17 @@ impl SyncService {
                     });
                 }
                 SyncPlanAction::ProcessNew { .. } | SyncPlanAction::Reprocess { .. } => {
-                    if scheduled_shas.contains_key(&sha_str) {
+                    if scheduled_shas.contains_key(&dedup_key) {
                         intra_batch_dups.push(IntraBatchDup {
                             item_index: idx,
                             path: discovered.path.clone(),
                             source_sha,
                             sha_hex: sha_str,
                             byte_size: file_len,
+                            dedup_key,
                         });
                     } else {
-                        scheduled_shas.insert(sha_str.clone(), idx);
+                        scheduled_shas.insert(dedup_key.clone(), idx);
                         pending_tasks.push(BatchTask::new(
                             &discovered.path,
                             PendingAssetWork {
@@ -520,6 +558,8 @@ impl SyncService {
                                 source_sha,
                                 sha_hex: sha_str,
                                 byte_size: file_len,
+                                relative_path,
+                                dedup_key,
                             },
                         ));
                     }
@@ -547,12 +587,15 @@ impl SyncService {
                     let source_sha = work.source_sha;
                     let sha_hex = work.sha_hex;
                     let byte_size = work.byte_size;
+                    let relative_path = work.relative_path;
+                    let dedup_key = work.dedup_key;
 
                     let work_res: Result<(OptimizationResult, SyncStorageOutput)> = (|| {
                         let opt_res = self.optimizer.optimize_file(&path, config)?;
-                        let object_key = storage.derive_object_key_for_optimization(
+                        let object_key = storage.derive_object_key_for_path(
                             &sha_hex,
                             opt_res.optimization_key.as_str(),
+                            relative_path.as_deref(),
                             opt_res.effective_format,
                         )?;
                         let content_type = opt_res.effective_format.mime_type();
@@ -573,6 +616,7 @@ impl SyncService {
                             item_index,
                             source_sha,
                             byte_size,
+                            dedup_key,
                             opt_res: Box::new(opt_res),
                             storage_out,
                         },
@@ -581,6 +625,7 @@ impl SyncService {
                             source_sha,
                             sha_hex,
                             byte_size,
+                            dedup_key,
                             error: e.to_string(),
                         },
                     })
@@ -593,15 +638,15 @@ impl SyncService {
                         item_index,
                         source_sha,
                         byte_size,
+                        dedup_key,
                         opt_res,
                         storage_out,
                     }) => {
-                        let sha_hex = source_sha.to_hex();
                         manifest.record_success(&path_str, &opt_res, &storage_out);
                         optimized_count += 1;
                         total_optimized += opt_res.validated_output.byte_size;
                         primary_outcomes.insert(
-                            sha_hex,
+                            dedup_key,
                             Ok((
                                 opt_res.validated_output.byte_size,
                                 opt_res.effective_format,
@@ -625,11 +670,12 @@ impl SyncService {
                         source_sha,
                         sha_hex,
                         byte_size,
+                        dedup_key,
                         error,
                     }) => {
                         manifest.record_failure(&path_str, Some(&sha_hex), &error);
                         failed_count += 1;
-                        primary_outcomes.insert(sha_hex, Err(error.clone()));
+                        primary_outcomes.insert(dedup_key, Err(error.clone()));
                         items[item_index] = Some(SyncItemResult {
                             path: res.source_path,
                             source_sha256: Some(source_sha),
@@ -657,7 +703,7 @@ impl SyncService {
         // Phase 3: Resolve intra-batch identical content duplicates
         for dup in intra_batch_dups {
             let path_str = dup.path.to_string_lossy().to_string();
-            match primary_outcomes.get(&dup.sha_hex) {
+            match primary_outcomes.get(&dup.dedup_key) {
                 Some(Ok((opt_size, fmt, remote_url))) => {
                     manifest.record_path_alias(&dup.sha_hex, &path_str);
                     skipped_count += 1;

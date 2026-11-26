@@ -1,3 +1,5 @@
+use std::path::{Component, Path};
+
 use crate::interface::StorageError;
 
 /// Strategy for deriving remote object keys.
@@ -10,6 +12,9 @@ pub enum ObjectKeyMode {
     /// Content- and config-addressed (safe for `Cache-Control: immutable` when resize/preset changes):
     /// `images/{source_sha256}/{opt_hash_prefix}/optimized.{format}`.
     Variant,
+    /// Path-preserving human-readable keys using source relative directory and filename stem:
+    /// `{prefix}/{rel_dir}/{stem}.{format}`.
+    Path,
 }
 
 /// Derive a deterministic, path-independent object key in storage.
@@ -97,6 +102,69 @@ pub fn derive_object_key_with_prefix(
     prepend_key_prefix(prefix, base_key)
 }
 
+/// Derive a human-readable, path-preserving object key from a relative source path and output format.
+///
+/// Format: `{prefix}/{rel_parent}/{stem}.{format}` (omitting `{prefix}/` or `{rel_parent}/` when empty).
+pub fn derive_path_object_key(
+    prefix: Option<&str>,
+    relative_path: &Path,
+    format: &str,
+) -> Result<String, StorageError> {
+    if format.is_empty() || !format.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(StorageError::InvalidParameter(
+            "format contains invalid or unsafe characters".into(),
+        ));
+    }
+    let clean_fmt = format.to_ascii_lowercase();
+
+    let mut clean_parts: Vec<String> = Vec::new();
+    for comp in relative_path.components() {
+        match comp {
+            Component::CurDir => continue,
+            Component::Normal(seg) => {
+                let s = seg.to_str().ok_or_else(|| {
+                    StorageError::InvalidParameter(
+                        "relative path contains non-UTF-8 characters".into(),
+                    )
+                })?;
+                if s.is_empty()
+                    || s == ".."
+                    || s.chars()
+                        .any(|c| c.is_ascii_control() || matches!(c, '\\' | '?' | '#'))
+                {
+                    return Err(StorageError::InvalidParameter(
+                        "relative path contains invalid or unsafe characters".into(),
+                    ));
+                }
+                clean_parts.push(s.to_string());
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(StorageError::InvalidParameter(
+                    "relative path contains path traversal or root components".into(),
+                ));
+            }
+        }
+    }
+
+    let filename = clean_parts.pop().ok_or_else(|| {
+        StorageError::InvalidParameter("relative path must include a filename".into())
+    })?;
+    let stem = Path::new(&filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(filename.as_str());
+
+    let out_filename = format!("{stem}.{clean_fmt}");
+    let base_key = if clean_parts.is_empty() {
+        out_filename
+    } else {
+        format!("{}/{out_filename}", clean_parts.join("/"))
+    };
+
+    prepend_key_prefix(prefix, base_key)
+}
+
 /// Derive a deterministic object key according to `ObjectKeyMode` and an optional prefix.
 pub fn derive_object_key_for_mode(
     mode: ObjectKeyMode,
@@ -118,6 +186,9 @@ pub fn derive_object_key_for_mode(
             let variant_key = base_key.replacen("/optimized.", &format!("/{tag}/optimized."), 1);
             prepend_key_prefix(prefix, variant_key)
         }
+        ObjectKeyMode::Path => Err(StorageError::InvalidParameter(
+            "relative_path is required for ObjectKeyMode::Path; use derive_path_object_key".into(),
+        )),
     }
 }
 
@@ -241,5 +312,27 @@ mod tests {
             "assets/images/a1b2c3d4e5f6/fedcba987654/optimized.webp"
         );
         assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn test_derive_path_object_key_preserves_names_and_folders() {
+        assert_eq!(
+            derive_path_object_key(Some("projectA/full"), Path::new("dog.jpeg"), "avif").unwrap(),
+            "projectA/full/dog.avif"
+        );
+        assert_eq!(
+            derive_path_object_key(
+                Some("projectA/icon"),
+                Path::new("ui/buttons/save.png"),
+                "webp"
+            )
+            .unwrap(),
+            "projectA/icon/ui/buttons/save.webp"
+        );
+        assert_eq!(
+            derive_path_object_key(None, Path::new("logo.png"), "webp").unwrap(),
+            "logo.webp"
+        );
+        assert!(derive_path_object_key(Some("proj"), Path::new("../secret.png"), "webp").is_err());
     }
 }

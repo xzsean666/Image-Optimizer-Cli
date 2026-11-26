@@ -34,7 +34,7 @@ jobs:
 
       - name: Install imgopt CLI (prebuilt release)
         run: |
-          TAG="v0.1.0"
+          TAG="v0.1.2"
           curl -sSL "https://github.com/xzsean666/Image-Optimizer-Cli/releases/download/${TAG}/imgopt-linux-x86_64.tar.gz" -o imgopt.tar.gz
           tar -xzf imgopt.tar.gz
           chmod +x imgopt

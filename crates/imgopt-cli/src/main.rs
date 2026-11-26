@@ -275,6 +275,7 @@ struct OptimizeArgs {
 enum KeyModeArg {
     Content,
     Variant,
+    Path,
 }
 
 impl From<KeyModeArg> for ObjectKeyMode {
@@ -282,6 +283,7 @@ impl From<KeyModeArg> for ObjectKeyMode {
         match m {
             KeyModeArg::Content => ObjectKeyMode::Content,
             KeyModeArg::Variant => ObjectKeyMode::Variant,
+            KeyModeArg::Path => ObjectKeyMode::Path,
         }
     }
 }
@@ -307,7 +309,7 @@ struct SyncArgs {
     #[arg(long, default_value = "webp")]
     format: String,
 
-    /// Object key derivation strategy (content = images/{sha}/optimized.{ext}, variant = images/{sha}/{opt_tag}/optimized.{ext})
+    /// Object key derivation strategy (content, variant, or path = {prefix}/{rel_dir}/{stem}.{ext})
     #[arg(long, value_enum, default_value_t = KeyModeArg::Content)]
     key_mode: KeyModeArg,
 
@@ -959,7 +961,7 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let manifest_store = ManifestStore::new(&manifest_path);
-    let mut manifest_adapter = ManifestSyncAdapter::new(manifest_store, version)?;
+    let manifest_adapter = ManifestSyncAdapter::new(manifest_store, version)?;
 
     let batch_options = BatchOptions {
         concurrency: args.filter.concurrency.unwrap_or(4).max(1),
@@ -967,6 +969,7 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let key_mode: ObjectKeyMode = args.key_mode.into();
+    let mut manifest_adapter = manifest_adapter.with_path_keyed(key_mode == ObjectKeyMode::Path);
     let sync_result: SyncRunResult = if args.dry_run {
         let bucket = args.bucket.unwrap_or_else(|| "dry-run-bucket".into());
         let storage = MemoryObjectStorage::new();
@@ -1300,13 +1303,15 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Verifying Manifest: {}", manifest_path.display());
     println!("  Schema Version:    {}", manifest.schema_version);
     println!("  Optimizer Version: {}", manifest.optimizer_version);
-    println!("  Total Entries:     {}", manifest.entries.len());
+    println!(
+        "  Total Entries:     {}",
+        manifest.entries.len() + manifest.path_entries.len()
+    );
 
     let storage_client = if args.check_storage {
         let fallback_bucket = args.bucket.clone().or_else(|| {
             manifest
-                .entries
-                .values()
+                .all_entries()
                 .find_map(|e| e.storage.as_ref().map(|s| s.bucket.clone()))
         });
         let s3_config = S3StorageConfig::from_env_with_cli_overrides(
@@ -1334,7 +1339,12 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut storage_checks: Vec<BatchTask<PendingStorageCheck>> = Vec::new();
 
-    for (sha, entry) in &manifest.entries {
+    for (sha, entry) in manifest.entries.iter().map(|(k, v)| (k.as_str(), v)).chain(
+        manifest
+            .path_entries
+            .values()
+            .map(|v| (v.source.sha256.as_str(), v)),
+    ) {
         if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
             eprintln!("  [INVALID] Malformed SHA-256 key: {sha}");
             invalid_count += 1;
@@ -1537,8 +1547,7 @@ fn run_gc(args: GcArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let fallback_bucket = args.bucket.clone().or_else(|| {
         manifest
-            .entries
-            .values()
+            .all_entries()
             .find_map(|e| e.storage.as_ref().map(|s| s.bucket.clone()))
     });
 
@@ -1562,8 +1571,7 @@ fn run_gc(args: GcArgs) -> Result<(), Box<dyn std::error::Error>> {
     let client = S3Client::new(s3_config)?;
 
     let active_keys: HashSet<String> = manifest
-        .entries
-        .values()
+        .all_entries()
         .filter_map(|e| e.storage.as_ref())
         .filter(|st| st.bucket == bucket)
         .map(|st| st.object_key.clone())

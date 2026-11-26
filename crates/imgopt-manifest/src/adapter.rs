@@ -15,6 +15,7 @@ use crate::store::{ManifestLock, ManifestStore};
 pub struct ManifestSyncAdapter {
     pub store: ManifestStore,
     pub manifest: Manifest,
+    pub path_keyed: bool,
     _lock: ManifestLock,
 }
 
@@ -25,8 +26,14 @@ impl ManifestSyncAdapter {
         Ok(Self {
             store,
             manifest,
+            path_keyed: false,
             _lock: lock,
         })
+    }
+
+    pub fn with_path_keyed(mut self, path_keyed: bool) -> Self {
+        self.path_keyed = path_keyed;
+        self
     }
 }
 
@@ -68,6 +75,42 @@ impl SyncManifest for ManifestSyncAdapter {
         bucket: &str,
         expected_object_key: Option<&str>,
     ) -> SyncPlanAction {
+        if self.path_keyed {
+            if let Some(exp_key) = expected_object_key {
+                if let Some(entry) = self.manifest.path_entries.get(exp_key) {
+                    let sha_matches = entry.source.sha256 == source_sha256;
+                    let opt_matches = entry
+                        .optimization
+                        .as_ref()
+                        .is_some_and(|o| o.optimization_key == current_opt_key);
+                    let storage_matches = entry.storage.as_ref().is_some_and(|st| {
+                        st.verified && st.bucket == bucket && st.object_key == exp_key
+                    });
+                    if entry.status == EntryStatus::Uploaded
+                        && sha_matches
+                        && opt_matches
+                        && storage_matches
+                    {
+                        let st = entry.storage.as_ref().unwrap();
+                        let opt = entry.optimization.as_ref().unwrap();
+                        return SyncPlanAction::SkipUpToDate {
+                            source_sha256: source_sha256.to_string(),
+                            storage_url: st.public_url.clone(),
+                            optimized_bytes: opt.output_size,
+                            format: opt.output_format,
+                        };
+                    }
+                    return SyncPlanAction::Reprocess {
+                        source_sha256: source_sha256.to_string(),
+                        reason: "path-keyed asset source or optimization changed".into(),
+                    };
+                }
+            }
+            return SyncPlanAction::ProcessNew {
+                source_sha256: source_sha256.to_string(),
+            };
+        }
+
         let action = self.evaluate(source_sha256, current_opt_key);
         if matches!(action, SyncPlanAction::SkipUpToDate { .. }) {
             if let Some(st) = self
@@ -128,7 +171,14 @@ impl SyncManifest for ManifestSyncAdapter {
             known_paths: vec![source_path.to_string()],
         };
 
-        self.manifest.insert(entry);
+        if self.path_keyed {
+            self.manifest
+                .path_entries
+                .insert(storage_out.object_key.clone(), entry);
+            self.manifest.touch();
+        } else {
+            self.manifest.insert(entry);
+        }
     }
 
     fn record_failure(&mut self, source_path: &str, source_sha256: Option<&str>, _error: &str) {

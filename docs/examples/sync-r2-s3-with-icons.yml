@@ -1,0 +1,112 @@
+# 示例：上传图片到 Git 仓库后自动生成「TinyPNG 级高压缩主图 + 极小缩略图 Icon」双版本，
+# 分别增量同步至 Cloudflare R2 / AWS S3，并生成合并后的 CDN 公共链接清单 `urls.json`。
+# 复制此文件到你的素材仓库 `.github/workflows/sync-images.yml` 即可使用。
+#
+# 需要配置的 GitHub Repository Secrets：
+#   - IMGOPT_S3_ACCESS_KEY_ID      (R2/S3 Access Key ID)
+#   - IMGOPT_S3_SECRET_ACCESS_KEY  (R2/S3 Secret Access Key)
+#
+# 需要配置的 GitHub Repository Variables（或直接写死在 env 中）：
+#   - IMGOPT_S3_BUCKET             (存储桶名称)
+#   - IMGOPT_S3_ENDPOINT           (R2 填 https://<account_id>.r2.cloudflarestorage.com)
+#   - IMGOPT_S3_REGION             (R2 填 auto，AWS S3 填对应区域如 us-east-1)
+#   - IMGOPT_PUBLIC_URL_BASE       (CDN 公开访问域名，如 https://cdn.example.com)
+
+name: Optimize Images + Icons and Sync to S3/R2
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "images/**"
+      - ".github/workflows/sync-images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install imgopt CLI (prebuilt release, no build required)
+        run: |
+          TAG="v0.1.2"
+          curl -sSL "https://github.com/xzsean666/Image-Optimizer-Cli/releases/download/${TAG}/imgopt-linux-x86_64.tar.gz" -o imgopt.tar.gz
+          tar -xzf imgopt.tar.gz
+          chmod +x imgopt
+          sudo mv imgopt /usr/local/bin/imgopt
+          rm -f imgopt.tar.gz
+
+      - name: Optimize and sync full images + thumbnail icons to S3 / R2
+        env:
+          IMGOPT_S3_BUCKET: ${{ vars.IMGOPT_S3_BUCKET }}
+          IMGOPT_S3_ENDPOINT: ${{ vars.IMGOPT_S3_ENDPOINT }}
+          IMGOPT_S3_REGION: ${{ vars.IMGOPT_S3_REGION || 'auto' }}
+          IMGOPT_PUBLIC_URL_BASE: ${{ vars.IMGOPT_PUBLIC_URL_BASE }}
+          IMGOPT_S3_ACCESS_KEY_ID: ${{ secrets.IMGOPT_S3_ACCESS_KEY_ID }}
+          IMGOPT_S3_SECRET_ACCESS_KEY: ${{ secrets.IMGOPT_S3_SECRET_ACCESS_KEY }}
+        run: |
+          mkdir -p images
+
+          # 1) 主图：视觉无损高压缩（Balanced 预设 + 自动择优 WebP/AVIF/原格式）
+          # 如果希望尽量保留原格式（如 PNG 走调色板量化 + OxiPNG），可将 --format auto 改为 --format preserve
+          imgopt sync ./images \
+            --prefix full \
+            --format auto \
+            --preset balanced \
+            --key-mode variant \
+            --manifest .imgopt-manifest-full.json \
+            --json sync-report-full.json \
+            --urls-json urls-full.json \
+            --fail-on-error
+
+          # 2) 缩略图 Icon：极小尺寸（默认 64x64 居中裁剪 WebP，可按需调整宽高或改用 scale-down）
+          # 注意：必须使用独立的 --manifest 与 --prefix，避免与主图记录互相覆盖
+          imgopt sync ./images \
+            --prefix icons \
+            --format force-webp \
+            --preset aggressive \
+            --resize-width 64 \
+            --resize-height 64 \
+            --resize-mode cover \
+            --key-mode variant \
+            --manifest .imgopt-manifest-icons.json \
+            --json sync-report-icons.json \
+            --urls-json urls-icons.json \
+            --fail-on-error
+
+          # 3) 合并主图与缩略图链接为统一的 urls.json
+          jq -n \
+            --slurpfile full urls-full.json \
+            --slurpfile icons urls-icons.json '
+            ((($full[0] // {}) + ($icons[0] // {})) | keys) as $keys
+            | reduce $keys[] as $k ({}; .[$k] = {
+                url: ($full[0][$k] // null),
+                icon: ($icons[0][$k] // null)
+              })
+          ' > urls.json
+
+      - name: Publish CDN URLs to GitHub Step Summary
+        if: always() && hashFiles('urls.json') != ''
+        run: |
+          {
+            echo "### Image Optimization & CDN Links (Full + Icon)"
+            echo ""
+            echo "| File | Full URL | Icon URL |"
+            echo "|---|---|---|"
+            jq -r 'to_entries[] | "| `\(.key)` | \(.value.url // "-") | \(.value.icon // "-") |"' urls.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit updated manifests and urls.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .imgopt-manifest-full.json .imgopt-manifest-icons.json urls.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(images): update manifests and CDN URLs [skip ci]"
+            git push
+          fi

@@ -68,6 +68,8 @@ pub struct Manifest {
     pub created_at: String,
     pub updated_at: String,
     pub entries: BTreeMap<String, ManifestEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub path_entries: BTreeMap<String, ManifestEntry>,
 }
 
 impl Manifest {
@@ -79,6 +81,7 @@ impl Manifest {
             created_at: now.clone(),
             updated_at: now,
             entries: BTreeMap::new(),
+            path_entries: BTreeMap::new(),
         }
     }
 
@@ -93,7 +96,13 @@ impl Manifest {
             created_at: created_at.into(),
             updated_at: updated_at.into(),
             entries: BTreeMap::new(),
+            path_entries: BTreeMap::new(),
         }
+    }
+
+    /// Iterate over all manifest entries across both content-addressed and path-keyed maps.
+    pub fn all_entries(&self) -> impl Iterator<Item = &ManifestEntry> {
+        self.entries.values().chain(self.path_entries.values())
     }
 
     pub fn touch(&mut self) {
