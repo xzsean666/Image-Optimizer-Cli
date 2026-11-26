@@ -52,36 +52,36 @@ pub fn detect_format(bytes: &[u8]) -> Result<ImageFormat> {
         return Ok(ImageFormat::Webp);
     }
 
-    // Detect known but unsupported image formats to give descriptive error messages
+    // GIF check: GIF87a or GIF89a
     if bytes.starts_with(GIF87A_MAGIC) || bytes.starts_with(GIF89A_MAGIC) {
-        return Err(ImgoptError::new(
-            PipelineStage::FormatDetection,
-            ErrorKind::UnsupportedFormat("GIF format is not supported for V1 optimization".into()),
-        ));
+        return Ok(ImageFormat::Gif);
     }
 
     if bytes.starts_with(BMP_MAGIC) {
         return Err(ImgoptError::new(
             PipelineStage::FormatDetection,
-            ErrorKind::UnsupportedFormat("BMP format is not supported for V1 optimization".into()),
+            ErrorKind::UnsupportedFormat("BMP format is not supported for optimization".into()),
         ));
     }
 
     if bytes.starts_with(TIFF_LE_MAGIC) || bytes.starts_with(TIFF_BE_MAGIC) {
         return Err(ImgoptError::new(
             PipelineStage::FormatDetection,
-            ErrorKind::UnsupportedFormat("TIFF format is not supported for V1 optimization".into()),
+            ErrorKind::UnsupportedFormat("TIFF format is not supported for optimization".into()),
         ));
     }
 
     // Check for ISO Base Media File Format (AVIF, HEIC, etc.)
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
         let brand = &bytes[8..12];
+        if brand == b"avif" || brand == b"avis" {
+            return Ok(ImageFormat::Avif);
+        }
         let brand_str = String::from_utf8_lossy(brand);
         return Err(ImgoptError::new(
             PipelineStage::FormatDetection,
             ErrorKind::UnsupportedFormat(format!(
-                "ISO media container format ('{brand_str}') is not supported for V1 optimization"
+                "ISO media container format ('{brand_str}') is not supported for optimization"
             )),
         ));
     }
@@ -139,12 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_unsupported_formats() {
+    fn test_detect_supported_gif_and_avif_and_unsupported_formats() {
         let gif_bytes = b"GIF89a\x01\x00\x01\x00";
-        assert!(matches!(
-            detect_format(gif_bytes).unwrap_err().kind,
-            ErrorKind::UnsupportedFormat(ref msg) if msg.contains("GIF")
-        ));
+        assert_eq!(detect_format(gif_bytes).unwrap(), ImageFormat::Gif);
+
+        let avif_bytes = b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00";
+        assert_eq!(detect_format(avif_bytes).unwrap(), ImageFormat::Avif);
 
         let bmp_bytes = b"BM\x36\x00\x00\x00";
         assert!(matches!(
@@ -158,10 +158,10 @@ mod tests {
             ErrorKind::UnsupportedFormat(ref msg) if msg.contains("TIFF")
         ));
 
-        let avif_bytes = b"\x00\x00\x00\x1cftypavif\x00\x00\x00\x00";
+        let heic_bytes = b"\x00\x00\x00\x1cftypheic\x00\x00\x00\x00";
         assert!(matches!(
-            detect_format(avif_bytes).unwrap_err().kind,
-            ErrorKind::UnsupportedFormat(ref msg) if msg.contains("avif")
+            detect_format(heic_bytes).unwrap_err().kind,
+            ErrorKind::UnsupportedFormat(ref msg) if msg.contains("heic")
         ));
     }
 

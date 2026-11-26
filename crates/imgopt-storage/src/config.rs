@@ -17,6 +17,7 @@ pub struct S3StorageConfig {
     pub force_path_style: bool,
     pub key_prefix: Option<String>,
     pub public_url_base: Option<String>,
+    pub cache_control: Option<String>,
     pub timeout_seconds: u64,
 }
 
@@ -35,6 +36,7 @@ impl fmt::Debug for S3StorageConfig {
             .field("force_path_style", &self.force_path_style)
             .field("key_prefix", &self.key_prefix)
             .field("public_url_base", &self.public_url_base)
+            .field("cache_control", &self.cache_control)
             .field("timeout_seconds", &self.timeout_seconds)
             .finish()
     }
@@ -52,6 +54,7 @@ impl Default for S3StorageConfig {
             force_path_style: true,
             key_prefix: None,
             public_url_base: None,
+            cache_control: None,
             timeout_seconds: 30,
         }
     }
@@ -71,76 +74,124 @@ impl S3StorageConfig {
         prefix_override: Option<String>,
         public_url_override: Option<String>,
     ) -> Result<Self, StorageError> {
+        Self::from_env_with_cli_overrides(
+            bucket_override,
+            endpoint_override,
+            prefix_override,
+            public_url_override,
+            None,
+            None,
+        )
+    }
+
+    /// Load S3 configuration from environment variables with full CLI overrides including
+    /// `force_path_style` and `cache_control`.
+    pub fn from_env_with_cli_overrides(
+        bucket_override: Option<String>,
+        endpoint_override: Option<String>,
+        prefix_override: Option<String>,
+        public_url_override: Option<String>,
+        force_path_style_override: Option<bool>,
+        cache_control_override: Option<String>,
+    ) -> Result<Self, StorageError> {
+        Self::from_lookup_with_overrides(
+            |key| env::var(key).ok(),
+            bucket_override,
+            endpoint_override,
+            prefix_override,
+            public_url_override,
+            force_path_style_override,
+            cache_control_override,
+        )
+    }
+
+    pub(crate) fn from_lookup_with_overrides<F>(
+        lookup: F,
+        bucket_override: Option<String>,
+        endpoint_override: Option<String>,
+        prefix_override: Option<String>,
+        public_url_override: Option<String>,
+        force_path_style_override: Option<bool>,
+        cache_control_override: Option<String>,
+    ) -> Result<Self, StorageError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let bucket = bucket_override
-            .or_else(|| {
-                env::var("IMGOPT_S3_BUCKET")
-                    .or_else(|_| env::var("AWS_S3_BUCKET"))
-                    .ok()
-            })
-            .filter(|s| !s.trim().is_empty())
+            .or_else(|| lookup("IMGOPT_S3_BUCKET").or_else(|| lookup("AWS_S3_BUCKET")))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 StorageError::InvalidParameter(
                     "missing required storage bucket (IMGOPT_S3_BUCKET / AWS_S3_BUCKET or --bucket)".into(),
                 )
             })?;
 
-        let access_key_id = env::var("IMGOPT_S3_ACCESS_KEY_ID")
-            .or_else(|_| env::var("AWS_ACCESS_KEY_ID"))
-            .map_err(|_| {
+        let access_key_id = lookup("IMGOPT_S3_ACCESS_KEY_ID")
+            .or_else(|| lookup("AWS_ACCESS_KEY_ID"))
+            .ok_or_else(|| {
                 StorageError::InvalidParameter(
                     "missing required environment variable IMGOPT_S3_ACCESS_KEY_ID or AWS_ACCESS_KEY_ID".into(),
                 )
-            })?;
+            })?
+            .trim()
+            .to_string();
 
-        let secret_access_key = env::var("IMGOPT_S3_SECRET_ACCESS_KEY")
-            .or_else(|_| env::var("AWS_SECRET_ACCESS_KEY"))
-            .map_err(|_| {
+        let secret_access_key = lookup("IMGOPT_S3_SECRET_ACCESS_KEY")
+            .or_else(|| lookup("AWS_SECRET_ACCESS_KEY"))
+            .ok_or_else(|| {
                 StorageError::InvalidParameter(
                     "missing required environment variable IMGOPT_S3_SECRET_ACCESS_KEY or AWS_SECRET_ACCESS_KEY".into(),
                 )
-            })?;
+            })?
+            .trim()
+            .to_string();
 
-        let session_token = env::var("IMGOPT_S3_SESSION_TOKEN")
-            .or_else(|_| env::var("AWS_SESSION_TOKEN"))
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+        let session_token = lookup("IMGOPT_S3_SESSION_TOKEN")
+            .or_else(|| lookup("AWS_SESSION_TOKEN"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
-        let region = env::var("IMGOPT_S3_REGION")
-            .or_else(|_| env::var("AWS_REGION"))
-            .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".into());
+        let region = lookup("IMGOPT_S3_REGION")
+            .or_else(|| lookup("AWS_REGION"))
+            .or_else(|| lookup("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| "us-east-1".into())
+            .trim()
+            .to_string();
 
         let endpoint = endpoint_override
-            .or_else(|| {
-                env::var("IMGOPT_S3_ENDPOINT")
-                    .or_else(|_| env::var("AWS_ENDPOINT_URL"))
-                    .ok()
-            })
-            .filter(|s| !s.trim().is_empty());
+            .or_else(|| lookup("IMGOPT_S3_ENDPOINT").or_else(|| lookup("AWS_ENDPOINT_URL")))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
-        let force_path_style = env::var("IMGOPT_S3_FORCE_PATH_STYLE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true);
+        let force_path_style = force_path_style_override.unwrap_or_else(|| {
+            lookup("IMGOPT_S3_FORCE_PATH_STYLE")
+                .map(|v| {
+                    let v = v.trim();
+                    v == "1" || v.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(true)
+        });
 
         let key_prefix = prefix_override
-            .or_else(|| {
-                env::var("IMGOPT_S3_KEY_PREFIX")
-                    .or_else(|_| env::var("IMGOPT_S3_PREFIX"))
-                    .ok()
-            })
-            .filter(|s| !s.trim().is_empty());
+            .or_else(|| lookup("IMGOPT_S3_KEY_PREFIX").or_else(|| lookup("IMGOPT_S3_PREFIX")))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let public_url_base = public_url_override
             .or_else(|| {
-                env::var("IMGOPT_PUBLIC_URL_BASE")
-                    .or_else(|_| env::var("IMGOPT_S3_PUBLIC_URL_BASE"))
-                    .ok()
+                lookup("IMGOPT_PUBLIC_URL_BASE").or_else(|| lookup("IMGOPT_S3_PUBLIC_URL_BASE"))
             })
-            .filter(|s| !s.trim().is_empty());
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
-        let timeout_seconds = env::var("IMGOPT_S3_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let cache_control = cache_control_override
+            .or_else(|| lookup("IMGOPT_S3_CACHE_CONTROL"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let timeout_seconds = lookup("IMGOPT_S3_TIMEOUT")
+            .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(30);
 
         let config = Self {
@@ -153,6 +204,7 @@ impl S3StorageConfig {
             force_path_style,
             key_prefix,
             public_url_base,
+            cache_control,
             timeout_seconds,
         };
 
@@ -286,6 +338,7 @@ mod tests {
             force_path_style: false,
             key_prefix: Some("custom/prefix".into()),
             public_url_base: Some("https://cdn.example.com".into()),
+            cache_control: Some("public, max-age=31536000, immutable".into()),
             timeout_seconds: 30,
         };
 
@@ -317,5 +370,32 @@ mod tests {
 
         config.endpoint = Some("ftp://bad.example.com".into());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_from_lookup_trims_credentials_and_optional_fields() {
+        let cfg = S3StorageConfig::from_lookup_with_overrides(
+            |k| match k {
+                "IMGOPT_S3_BUCKET" => Some("  my-bucket \n".into()),
+                "IMGOPT_S3_ACCESS_KEY_ID" => Some("  AKIA123  ".into()),
+                "IMGOPT_S3_SECRET_ACCESS_KEY" => Some("\tsecret456\n".into()),
+                "IMGOPT_S3_SESSION_TOKEN" => Some("   ".into()),
+                "IMGOPT_S3_REGION" => Some(" auto ".into()),
+                _ => None,
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.bucket, "my-bucket");
+        assert_eq!(cfg.access_key_id, "AKIA123");
+        assert_eq!(cfg.secret_access_key, "secret456");
+        assert_eq!(cfg.session_token, None);
+        assert_eq!(cfg.region, "auto");
     }
 }

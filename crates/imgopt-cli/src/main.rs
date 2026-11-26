@@ -3,20 +3,26 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use imgopt_codecs::decode_animation_with_limits;
 use imgopt_core::{
-    analyze_image, execute_batch_scoped, read_file_bounded, run_benchmark_with_concurrency,
-    scan_path, BatchOptions, BatchTask, ImageFormat, MetadataPolicy, OptimizationConfig,
-    OptimizationPreset, OptimizationService, OutputFormatPolicy, PipelineStage, ResourceLimits,
-    ScanOptions, SyncItemStatus, SyncRunResult, SyncService,
+    analyze_image, compute_byte_savings, detect_format_from_reader, execute_batch_scoped,
+    hash_file, read_file_bounded, run_benchmark_with_options, scan_path, utc_now_rfc3339,
+    BatchOptions, BatchTask, Dimensions, ImageFormat, MetadataPolicy, OptimizationConfig,
+    OptimizationKey, OptimizationPreset, OptimizationService, OutputFormatPolicy, PipelineStage,
+    ResizeMode, ResourceLimits, ScanOptions, SyncItemStatus, SyncRunResult, SyncService,
 };
 use imgopt_manifest::{
-    EntryStatus, ManifestStore, ManifestSyncAdapter, RunItemStatus, RunResult, RunResultRecord,
+    EntryStatus, ManifestEntry, ManifestOptimizationRecord, ManifestSourceRecord, ManifestStore,
+    ManifestSyncAdapter, RunItemStatus, RunResult, RunResultRecord,
 };
 use imgopt_storage::{
     MemoryObjectStorage, ObjectStorage, RetryPolicy, S3Client, S3StorageConfig, StorageSyncAdapter,
 };
+
+const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Parser, Debug)]
 #[command(name = "imgopt", version, about = "Image Optimizer CLI")]
@@ -48,17 +54,17 @@ fn load_dotenv_file(path: &Path, required: bool) -> Result<(), Box<dyn std::erro
             continue;
         };
         let key = k.trim();
-        if key.is_empty()
-            || !key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
 
         let val_trimmed = v.trim();
-        let val = if (val_trimmed.starts_with('"') && val_trimmed.ends_with('"') && val_trimmed.len() >= 2)
-            || (val_trimmed.starts_with('\'') && val_trimmed.ends_with('\'') && val_trimmed.len() >= 2)
+        let val = if (val_trimmed.starts_with('"')
+            && val_trimmed.ends_with('"')
+            && val_trimmed.len() >= 2)
+            || (val_trimmed.starts_with('\'')
+                && val_trimmed.ends_with('\'')
+                && val_trimmed.len() >= 2)
         {
             &val_trimmed[1..val_trimmed.len() - 1]
         } else {
@@ -76,34 +82,29 @@ fn load_dotenv_file(path: &Path, required: bool) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn parse_env_file_arg() -> Option<PathBuf> {
-    let args: Vec<String> = std::env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--" {
-            break;
-        }
-        if args[i] == "--env-file" && i + 1 < args.len() {
-            return Some(PathBuf::from(&args[i + 1]));
-        }
-        if let Some(val) = args[i].strip_prefix("--env-file=") {
-            return Some(PathBuf::from(val));
-        }
-    }
-    None
-}
-
 fn main() -> ExitCode {
-    if let Some(explicit_env) = parse_env_file_arg() {
-        if let Err(err) = load_dotenv_file(&explicit_env, true) {
+    let cli = Cli::parse();
+
+    let needs_storage_env = matches!(
+        &cli.command,
+        Commands::Sync(args) if !args.dry_run
+    ) || matches!(
+        &cli.command,
+        Commands::Verify(args) if args.check_storage
+    ) || matches!(&cli.command, Commands::Gc(_));
+
+    if let Some(ref explicit_env) = cli.env_file {
+        if let Err(err) = load_dotenv_file(explicit_env, true) {
             eprintln!("Error: {err}");
             return ExitCode::FAILURE;
         }
-    } else if let Err(err) = load_dotenv_file(Path::new(".env"), false) {
-        eprintln!("Error: {err}");
-        return ExitCode::FAILURE;
+    } else if needs_storage_env {
+        if let Err(err) = load_dotenv_file(Path::new(".env"), false) {
+            eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
     }
 
-    let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -125,114 +126,8 @@ enum Commands {
     Verify(VerifyArgs),
     /// Benchmark optimization performance across image datasets
     Benchmark(BenchmarkArgs),
-}
-
-#[derive(Parser, Debug)]
-struct OptimizeArgs {
-    /// Input file or directory to optimize
-    input: PathBuf,
-
-    /// Output destination directory or file path
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// Optimization preset (balanced, maximum, aggressive)
-    #[arg(long, value_enum, default_value_t = PresetArg::Balanced)]
-    preset: PresetArg,
-
-    /// Target quality (0.0 to 1.0)
-    #[arg(short, long)]
-    quality: Option<f64>,
-
-    /// Encoding effort level (1 to 6)
-    #[arg(short, long)]
-    effort: Option<u8>,
-
-    /// Output format policy (preserve, webp, jpeg, png)
-    #[arg(long, default_value = "preserve")]
-    format: String,
-
-    /// Preserve EXIF / ICC / XMP metadata (default is strip all)
-    #[arg(long)]
-    preserve_metadata: bool,
-
-    /// Max concurrency for worker pool
-    #[arg(long)]
-    concurrency: Option<usize>,
-
-    /// Maximum allowed image width in pixels
-    #[arg(long)]
-    max_width: Option<u32>,
-
-    /// Maximum allowed image height in pixels
-    #[arg(long)]
-    max_height: Option<u32>,
-}
-
-#[derive(Parser, Debug)]
-struct SyncArgs {
-    /// Input directory or file to synchronize
-    input: PathBuf,
-
-    /// Path to persistent manifest JSON file
-    #[arg(long)]
-    manifest: Option<PathBuf>,
-
-    /// Path to write machine-readable run result JSON
-    #[arg(long)]
-    json: Option<PathBuf>,
-
-    /// Optimization preset (balanced, maximum, aggressive)
-    #[arg(long, value_enum, default_value_t = PresetArg::Balanced)]
-    preset: PresetArg,
-
-    /// Target quality (0.0 to 1.0)
-    #[arg(short, long)]
-    quality: Option<f64>,
-
-    /// Encoding effort level (1 to 6)
-    #[arg(short, long)]
-    effort: Option<u8>,
-
-    /// Output format policy (preserve, webp, jpeg, png)
-    #[arg(long, default_value = "webp")]
-    format: String,
-
-    /// Preserve EXIF / ICC / XMP metadata (default is strip all)
-    #[arg(long)]
-    preserve_metadata: bool,
-
-    /// Override S3 bucket name
-    #[arg(long)]
-    bucket: Option<String>,
-
-    /// Override S3 endpoint URL
-    #[arg(long)]
-    endpoint: Option<String>,
-
-    /// Override S3 key prefix
-    #[arg(long)]
-    prefix: Option<String>,
-
-    /// Override public URL base
-    #[arg(long)]
-    public_url_base: Option<String>,
-
-    /// Max concurrency for worker pool
-    #[arg(long)]
-    concurrency: Option<usize>,
-
-    /// Maximum allowed image width in pixels
-    #[arg(long)]
-    max_width: Option<u32>,
-
-    /// Maximum allowed image height in pixels
-    #[arg(long)]
-    max_height: Option<u32>,
-
-    /// Use mock in-memory storage for dry runs or testing without remote S3 credentials
-    #[arg(long)]
-    dry_run: bool,
+    /// List or delete orphaned remote storage objects not referenced in manifest
+    Gc(GcArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +147,189 @@ impl From<PresetArg> for OptimizationPreset {
     }
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeModeArg {
+    ScaleDown,
+    Contain,
+    Cover,
+    Exact,
+}
+
+impl From<ResizeModeArg> for ResizeMode {
+    fn from(m: ResizeModeArg) -> Self {
+        match m {
+            ResizeModeArg::ScaleDown => ResizeMode::ScaleDown,
+            ResizeModeArg::Contain => ResizeMode::Contain,
+            ResizeModeArg::Cover => ResizeMode::Cover,
+            ResizeModeArg::Exact => ResizeMode::Exact,
+        }
+    }
+}
+
+#[derive(Args, Debug, Clone)]
+struct OptimizationArgs {
+    /// Optimization preset (balanced, maximum, aggressive)
+    #[arg(long, value_enum, default_value_t = PresetArg::Balanced)]
+    preset: PresetArg,
+
+    /// Target SSIM quality (0.0 to 1.0)
+    #[arg(short, long)]
+    quality: Option<f64>,
+
+    /// Encoding effort level (1 to 6)
+    #[arg(short, long)]
+    effort: Option<u8>,
+
+    /// Preserve all EXIF / ICC / XMP metadata (default strips all)
+    #[arg(long)]
+    preserve_metadata: bool,
+
+    /// Preserve ICC color profile while stripping EXIF and XMP privacy metadata
+    #[arg(long)]
+    preserve_icc: bool,
+
+    /// Disable automatic ICC-to-sRGB conversion when stripping ICC profiles
+    #[arg(long)]
+    no_srgb_convert: bool,
+
+    /// Maximum allowed input image width in pixels
+    #[arg(long)]
+    max_width: Option<u32>,
+
+    /// Maximum allowed input image height in pixels
+    #[arg(long)]
+    max_height: Option<u32>,
+
+    /// Target resize width in pixels
+    #[arg(long)]
+    resize_width: Option<u32>,
+
+    /// Target resize height in pixels
+    #[arg(long)]
+    resize_height: Option<u32>,
+
+    /// Resize strategy (scale-down, contain, cover, exact)
+    #[arg(long, value_enum, default_value_t = ResizeModeArg::ScaleDown)]
+    resize_mode: ResizeModeArg,
+}
+
+#[derive(Args, Debug, Clone)]
+struct FilterArgs {
+    /// Max concurrency for worker pool
+    #[arg(long)]
+    concurrency: Option<usize>,
+
+    /// Include files matching glob pattern (repeatable, e.g. "**/*.png")
+    #[arg(long = "include")]
+    include: Vec<String>,
+
+    /// Exclude files matching glob pattern (repeatable, e.g. "thumbs/**")
+    #[arg(long = "exclude")]
+    exclude: Vec<String>,
+}
+
+impl FilterArgs {
+    fn to_scan_options(&self) -> ScanOptions {
+        ScanOptions {
+            include_globs: self.include.clone(),
+            exclude_globs: self.exclude.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+struct OptimizeArgs {
+    /// Input file or directory to optimize
+    input: PathBuf,
+
+    /// Output destination directory or file path
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Output format policy (preserve, webp, avif, auto, jpeg, png, gif)
+    #[arg(long, default_value = "preserve")]
+    format: String,
+
+    /// Optional manifest JSON path for local incremental caching/dedup
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    /// Path to write machine-readable run result JSON
+    #[arg(long)]
+    json: Option<PathBuf>,
+
+    /// Suppress per-file stdout progress lines
+    #[arg(short = 'Q', long)]
+    quiet: bool,
+
+    #[command(flatten)]
+    opt: OptimizationArgs,
+
+    #[command(flatten)]
+    filter: FilterArgs,
+}
+
+#[derive(Parser, Debug)]
+struct SyncArgs {
+    /// Input directory or file to synchronize
+    input: PathBuf,
+
+    /// Path to persistent manifest JSON file
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    /// Path to write machine-readable run result JSON
+    #[arg(long)]
+    json: Option<PathBuf>,
+
+    /// Output format policy (preserve, webp, avif, auto, jpeg, png, gif)
+    #[arg(long, default_value = "webp")]
+    format: String,
+
+    /// Override S3 bucket name
+    #[arg(long)]
+    bucket: Option<String>,
+
+    /// Override S3 endpoint URL
+    #[arg(long)]
+    endpoint: Option<String>,
+
+    /// Override S3 key prefix
+    #[arg(long)]
+    prefix: Option<String>,
+
+    /// Override public URL base
+    #[arg(long)]
+    public_url_base: Option<String>,
+
+    /// Override Cache-Control header on uploaded objects
+    #[arg(long)]
+    cache_control: Option<String>,
+
+    /// Override S3 path-style URL setting (true/false)
+    #[arg(long)]
+    force_path_style: Option<bool>,
+
+    /// Use mock in-memory storage for dry runs or testing without remote S3 credentials
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Exit with a non-zero status code if any file fails during sync
+    #[arg(long)]
+    fail_on_error: bool,
+
+    /// Suppress per-file stdout progress lines
+    #[arg(short = 'Q', long)]
+    quiet: bool,
+
+    #[command(flatten)]
+    opt: OptimizationArgs,
+
+    #[command(flatten)]
+    filter: FilterArgs,
+}
+
 #[derive(Parser, Debug)]
 struct InspectArgs {
     /// Input file or directory to inspect
@@ -260,6 +338,22 @@ struct InspectArgs {
     /// Output inspection report as machine-readable JSON
     #[arg(long)]
     json: bool,
+
+    /// Maximum allowed image width in pixels
+    #[arg(long)]
+    max_width: Option<u32>,
+
+    /// Maximum allowed image height in pixels
+    #[arg(long)]
+    max_height: Option<u32>,
+
+    /// Include files matching glob pattern (repeatable)
+    #[arg(long = "include")]
+    include: Vec<String>,
+
+    /// Exclude files matching glob pattern (repeatable)
+    #[arg(long = "exclude")]
+    exclude: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -279,6 +373,14 @@ struct VerifyArgs {
     /// Override S3 endpoint URL for verification
     #[arg(long)]
     endpoint: Option<String>,
+
+    /// Override S3 path-style URL setting (true/false)
+    #[arg(long)]
+    force_path_style: Option<bool>,
+
+    /// Max concurrency for remote storage HEAD checks
+    #[arg(long)]
+    concurrency: Option<usize>,
 }
 
 #[derive(Parser, Debug)]
@@ -286,39 +388,52 @@ struct BenchmarkArgs {
     /// Dataset directory or image file to benchmark
     dataset: PathBuf,
 
-    /// Optimization preset (balanced, maximum, aggressive)
-    #[arg(long, value_enum, default_value_t = PresetArg::Balanced)]
-    preset: PresetArg,
-
-    /// Target quality (0.0 to 1.0)
-    #[arg(short, long)]
-    quality: Option<f64>,
-
-    /// Encoding effort level (1 to 6)
-    #[arg(short, long)]
-    effort: Option<u8>,
-
-    /// Output format policy (preserve, webp, jpeg, png)
+    /// Output format policy (preserve, webp, avif, auto, jpeg, png, gif)
     #[arg(long, default_value = "preserve")]
     format: String,
 
-    /// Preserve EXIF / ICC / XMP metadata (default is strip all)
-    #[arg(long)]
-    preserve_metadata: bool,
-
-    /// Max concurrency for worker pool
-    #[arg(long)]
-    concurrency: Option<usize>,
-
-    /// Maximum allowed image width in pixels
-    #[arg(long)]
-    max_width: Option<u32>,
-
-    /// Maximum allowed image height in pixels
-    #[arg(long)]
-    max_height: Option<u32>,
-
     /// Path to write machine-readable benchmark JSON report
+    #[arg(long)]
+    json: Option<PathBuf>,
+
+    /// Exit with a non-zero status code if any benchmark case fails
+    #[arg(long)]
+    fail_on_error: bool,
+
+    #[command(flatten)]
+    opt: OptimizationArgs,
+
+    #[command(flatten)]
+    filter: FilterArgs,
+}
+
+#[derive(Parser, Debug)]
+struct GcArgs {
+    /// Path to manifest file referencing active objects
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    /// Override S3 bucket
+    #[arg(long)]
+    bucket: Option<String>,
+
+    /// Override S3 endpoint URL
+    #[arg(long)]
+    endpoint: Option<String>,
+
+    /// Override S3 key prefix to scan for orphaned objects
+    #[arg(long)]
+    prefix: Option<String>,
+
+    /// Override S3 path-style URL setting (true/false)
+    #[arg(long)]
+    force_path_style: Option<bool>,
+
+    /// Actually delete orphaned objects (default is safe dry-run)
+    #[arg(long)]
+    delete: bool,
+
+    /// Path to write machine-readable GC report JSON
     #[arg(long)]
     json: Option<PathBuf>,
 }
@@ -327,24 +442,20 @@ fn parse_format_policy(format: &str) -> Result<OutputFormatPolicy, Box<dyn std::
     match format.trim().to_ascii_lowercase().as_str() {
         "preserve" | "original" => Ok(OutputFormatPolicy::PreserveOriginal),
         "webp" => Ok(OutputFormatPolicy::AllowWebp),
+        "avif" | "allow-avif" => Ok(OutputFormatPolicy::AllowAvif),
+        "auto" => Ok(OutputFormatPolicy::Auto),
         "jpeg" | "jpg" => Ok(OutputFormatPolicy::Force(ImageFormat::Jpeg)),
         "png" => Ok(OutputFormatPolicy::Force(ImageFormat::Png)),
+        "gif" => Ok(OutputFormatPolicy::Force(ImageFormat::Gif)),
+        "force-webp" => Ok(OutputFormatPolicy::Force(ImageFormat::Webp)),
+        "force-avif" => Ok(OutputFormatPolicy::Force(ImageFormat::Avif)),
         other => Err(format!("unsupported format policy: {other}").into()),
     }
 }
 
-struct OptimizationCliOptions<'a> {
-    preset: PresetArg,
-    quality: Option<f64>,
-    effort: Option<u8>,
-    format: &'a str,
-    preserve_metadata: bool,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
-}
-
 fn build_optimization_config(
-    opts: OptimizationCliOptions<'_>,
+    opts: &OptimizationArgs,
+    format: &str,
 ) -> Result<OptimizationConfig, Box<dyn std::error::Error>> {
     let mut config = OptimizationConfig::from_preset(opts.preset.into());
     if let Some(q) = opts.quality {
@@ -355,6 +466,11 @@ fn build_optimization_config(
     }
     if opts.preserve_metadata {
         config.metadata_policy = MetadataPolicy::PreserveAll;
+    } else if opts.preserve_icc {
+        config.metadata_policy = MetadataPolicy::PreserveIcc;
+    }
+    if opts.no_srgb_convert {
+        config.convert_to_srgb = false;
     }
     if opts.max_width.is_some() {
         config.max_width = opts.max_width;
@@ -362,7 +478,10 @@ fn build_optimization_config(
     if opts.max_height.is_some() {
         config.max_height = opts.max_height;
     }
-    config.output_format_policy = parse_format_policy(opts.format)?;
+    config.resize_width = opts.resize_width;
+    config.resize_height = opts.resize_height;
+    config.resize_mode = opts.resize_mode.into();
+    config.output_format_policy = parse_format_policy(format)?;
     config.validate()?;
     Ok(config)
 }
@@ -374,14 +493,79 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Inspect(args) => run_inspect(args),
         Commands::Verify(args) => run_verify(args),
         Commands::Benchmark(args) => run_benchmark_cmd(args),
+        Commands::Gc(args) => run_gc(args),
     }
 }
 
 fn is_safe_relative(path: &Path) -> bool {
     !path.is_absolute()
-        && !path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        && !path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+}
+
+fn compute_dest_path(
+    input_root: &Path,
+    output_arg: Option<&PathBuf>,
+    src_path: &Path,
+    is_single_file: bool,
+    target_format: ImageFormat,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if is_single_file {
+        if let Some(out_dest) = output_arg {
+            let is_dest_dir = out_dest.is_dir()
+                || out_dest.extension().is_none()
+                || out_dest.to_string_lossy().ends_with('/')
+                || out_dest.to_string_lossy().ends_with('\\');
+
+            if is_dest_dir {
+                let orig_name = src_path.file_stem().unwrap_or_default();
+                Ok(out_dest.join(format!(
+                    "{}.{}",
+                    orig_name.to_string_lossy(),
+                    target_format.extension()
+                )))
+            } else {
+                Ok(out_dest.clone())
+            }
+        } else {
+            let orig_stem = src_path.file_stem().unwrap_or_default();
+            Ok(src_path.with_file_name(format!(
+                "{}-optimized.{}",
+                orig_stem.to_string_lossy(),
+                target_format.extension()
+            )))
+        }
+    } else {
+        let relative = src_path.strip_prefix(input_root).map_err(|_| {
+            format!(
+                "discovered path '{}' escaped input root '{}'",
+                src_path.display(),
+                input_root.display()
+            )
+        })?;
+        if !is_safe_relative(relative) {
+            return Err(format!(
+                "unsafe relative path '{}' for '{}'",
+                relative.display(),
+                src_path.display()
+            )
+            .into());
+        }
+        let out_base = output_arg
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("optimized_output"));
+        let stem = relative.file_stem().unwrap_or_default();
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        Ok(out_base.join(parent).join(format!(
+            "{}.{}",
+            stem.to_string_lossy(),
+            target_format.extension()
+        )))
+    }
 }
 
 fn resolve_unique_dest_path(
@@ -429,45 +613,138 @@ fn resolve_unique_dest_path(
 }
 
 fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config = build_optimization_config(OptimizationCliOptions {
-        preset: args.preset,
-        quality: args.quality,
-        effort: args.effort,
-        format: &args.format,
-        preserve_metadata: args.preserve_metadata,
-        max_width: args.max_width,
-        max_height: args.max_height,
-    })?;
+    let start_time = Instant::now();
+    let config = build_optimization_config(&args.opt, &args.format)?;
+    let version = env!("CARGO_PKG_VERSION");
+    let service = OptimizationService::new(version);
 
-    let service = OptimizationService::new(env!("CARGO_PKG_VERSION"));
-    let scan_res = scan_path(&args.input, &ScanOptions::default())?;
+    let scan_opts = args.filter.to_scan_options();
+    let scan_res = scan_path(&args.input, &scan_opts)?;
 
-    if scan_res.files.is_empty() {
+    if scan_res.files.is_empty() && scan_res.errors.is_empty() {
         return Err(format!("no supported images found at '{}'", args.input.display()).into());
     }
 
     let is_single_file = scan_res.files.len() == 1 && args.input.is_file();
     let default_concurrency = BatchOptions::default().concurrency;
     let batch_opts = BatchOptions {
-        concurrency: args.concurrency.unwrap_or(default_concurrency).max(1),
+        concurrency: args
+            .filter
+            .concurrency
+            .unwrap_or(default_concurrency)
+            .max(1),
         stop_on_error: false,
     };
 
-    let tasks: Vec<BatchTask<()>> = scan_res
-        .files
-        .iter()
-        .map(|f| BatchTask::new(&f.path, ()))
-        .collect();
-
-    let (batch_results, _) = execute_batch_scoped(tasks, &batch_opts, |path, ()| {
-        service.optimize_file(&path, &config)
-    });
+    let mut manifest_adapter = if let Some(ref m_path) = args.manifest {
+        let store = ManifestStore::new(m_path);
+        Some(ManifestSyncAdapter::new(store, version)?)
+    } else {
+        None
+    };
 
     let mut total_original_bytes = 0u64;
     let mut total_optimized_bytes = 0u64;
     let mut processed_count = 0usize;
-    let mut failed_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut failed_count = scan_res.errors.len();
+    let mut run_records: Vec<RunResultRecord> = Vec::new();
+    for scan_err in &scan_res.errors {
+        eprintln!("Failed: {scan_err}");
+        run_records.push(RunResultRecord {
+            path: scan_err
+                .source_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| args.input.to_string_lossy().to_string()),
+            status: RunItemStatus::Failed,
+            source_sha256: None,
+            source_bytes: 0,
+            optimized_bytes: None,
+            format: None,
+            quality_score: None,
+            remote_url: None,
+            error: Some(scan_err.to_string()),
+        });
+    }
+
     let mut claimed_destinations = HashSet::new();
+    let mut tasks: Vec<BatchTask<(Option<String>, u64)>> = Vec::new();
+
+    // If local manifest caching is enabled, skip files whose SHA-256 + OptimizationKey already match
+    // and whose destination file still exists on disk.
+    for file in &scan_res.files {
+        if let Some(ref mut adapter) = manifest_adapter {
+            if let Ok(digest) = hash_file(&file.path) {
+                let sha_hex = digest.to_hex();
+                let mut matched_skip: Option<(ImageFormat, u64, PathBuf)> = None;
+                if let Some(entry) = adapter.manifest.get(&sha_hex) {
+                    if let Some(ref opt) = entry.optimization {
+                        let expected_key =
+                            OptimizationKey::compute(&digest, version, opt.output_format, &config);
+                        if opt.optimization_key == expected_key.as_str() {
+                            if let Ok(raw_dest) = compute_dest_path(
+                                &args.input,
+                                args.output.as_ref(),
+                                &file.path,
+                                is_single_file,
+                                opt.output_format,
+                            ) {
+                                let dest_path = if is_single_file {
+                                    raw_dest
+                                } else {
+                                    resolve_unique_dest_path(
+                                        raw_dest,
+                                        &file.path,
+                                        &mut claimed_destinations,
+                                    )
+                                };
+                                if dest_path.exists() {
+                                    matched_skip =
+                                        Some((opt.output_format, opt.output_size, dest_path));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((fmt, opt_bytes, dest_path)) = matched_skip {
+                    adapter
+                        .manifest
+                        .add_path_alias(&sha_hex, file.path.to_string_lossy().into_owned());
+                    skipped_count += 1;
+                    total_original_bytes += file.byte_size;
+                    total_optimized_bytes += opt_bytes;
+                    if !args.quiet {
+                        println!(
+                            "Skipped (cached): {} -> {} ({} bytes)",
+                            file.path.display(),
+                            dest_path.display(),
+                            opt_bytes
+                        );
+                    }
+                    run_records.push(RunResultRecord {
+                        path: file.path.to_string_lossy().to_string(),
+                        status: RunItemStatus::Skipped,
+                        source_sha256: Some(sha_hex),
+                        source_bytes: file.byte_size,
+                        optimized_bytes: Some(opt_bytes),
+                        format: Some(fmt.to_string()),
+                        quality_score: None,
+                        remote_url: None,
+                        error: None,
+                    });
+                    continue;
+                }
+                tasks.push(BatchTask::new(&file.path, (Some(sha_hex), file.byte_size)));
+                continue;
+            }
+        }
+        tasks.push(BatchTask::new(&file.path, (None, file.byte_size)));
+    }
+
+    let (batch_results, _) = execute_batch_scoped(tasks, &batch_opts, |path, (_sha, _sz)| {
+        service.optimize_file(&path, &config)
+    });
 
     for res in batch_results {
         let src_path = res.source_path;
@@ -476,67 +753,45 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 failed_count += 1;
                 eprintln!("Failed: {}: {e}", src_path.display());
+                run_records.push(RunResultRecord {
+                    path: src_path.to_string_lossy().to_string(),
+                    status: RunItemStatus::Failed,
+                    source_sha256: None,
+                    source_bytes: fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0),
+                    optimized_bytes: None,
+                    format: None,
+                    quality_score: None,
+                    remote_url: None,
+                    error: Some(e.to_string()),
+                });
                 continue;
             }
         };
 
-        let raw_dest_path = if is_single_file {
-            if let Some(ref out_dest) = args.output {
-                let is_dest_dir = out_dest.is_dir()
-                    || out_dest.extension().is_none()
-                    || out_dest.to_string_lossy().ends_with('/')
-                    || out_dest.to_string_lossy().ends_with('\\');
-
-                if is_dest_dir {
-                    let orig_name = src_path.file_stem().unwrap_or_default();
-                    out_dest.join(format!(
-                        "{}.{}",
-                        orig_name.to_string_lossy(),
-                        opt_res.effective_format.extension()
-                    ))
-                } else {
-                    out_dest.clone()
-                }
-            } else {
-                let orig_stem = src_path.file_stem().unwrap_or_default();
-                src_path.with_file_name(format!(
-                    "{}-optimized.{}",
-                    orig_stem.to_string_lossy(),
-                    opt_res.effective_format.extension()
-                ))
-            }
-        } else {
-            let relative = src_path
-                .strip_prefix(&args.input)
-                .map_err(|_| {
-                    format!(
-                        "discovered path '{}' escaped input root '{}'",
-                        src_path.display(),
-                        args.input.display()
-                    )
-                })?;
-            if !is_safe_relative(relative) {
+        let raw_dest_path = match compute_dest_path(
+            &args.input,
+            args.output.as_ref(),
+            &src_path,
+            is_single_file,
+            opt_res.effective_format,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
                 failed_count += 1;
-                eprintln!(
-                    "Failed: {}: unsafe relative path '{}'",
-                    src_path.display(),
-                    relative.display()
-                );
+                eprintln!("Failed: {e}");
+                run_records.push(RunResultRecord {
+                    path: src_path.to_string_lossy().to_string(),
+                    status: RunItemStatus::Failed,
+                    source_sha256: Some(opt_res.source_sha256.to_hex()),
+                    source_bytes: opt_res.validated_output.original_size,
+                    optimized_bytes: None,
+                    format: None,
+                    quality_score: None,
+                    remote_url: None,
+                    error: Some(e.to_string()),
+                });
                 continue;
             }
-            let out_base = args
-                .output
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from("optimized_output"));
-
-            let stem = relative.file_stem().unwrap_or_default();
-            let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-            out_base.join(parent).join(format!(
-                "{}.{}",
-                stem.to_string_lossy(),
-                opt_res.effective_format.extension()
-            ))
         };
 
         let dest_path = if is_single_file {
@@ -548,37 +803,95 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = write_atomically(&dest_path, &opt_res.validated_output.bytes) {
             failed_count += 1;
             eprintln!("Failed writing {}: {e}", dest_path.display());
+            run_records.push(RunResultRecord {
+                path: src_path.to_string_lossy().to_string(),
+                status: RunItemStatus::Failed,
+                source_sha256: Some(opt_res.source_sha256.to_hex()),
+                source_bytes: opt_res.validated_output.original_size,
+                optimized_bytes: None,
+                format: None,
+                quality_score: None,
+                remote_url: None,
+                error: Some(e.to_string()),
+            });
             continue;
+        }
+
+        if let Some(ref mut adapter) = manifest_adapter {
+            let sha_hex = opt_res.source_sha256.to_hex();
+            let existing_storage = adapter
+                .manifest
+                .get(&sha_hex)
+                .and_then(|e| e.storage.clone());
+            adapter.manifest.insert(ManifestEntry {
+                source: ManifestSourceRecord {
+                    sha256: sha_hex.clone(),
+                    format: opt_res.profile.format,
+                    byte_size: opt_res.profile.byte_size,
+                    dimensions: opt_res.profile.dimensions,
+                },
+                optimization: Some(ManifestOptimizationRecord {
+                    optimization_key: opt_res.optimization_key.to_string(),
+                    output_format: opt_res.effective_format,
+                    output_size: opt_res.validated_output.byte_size,
+                    quality_score: Some(opt_res.quality_score),
+                    preset: opt_res.preset.as_str().to_string(),
+                    completed_at: utc_now_rfc3339(),
+                }),
+                storage: existing_storage,
+                status: EntryStatus::Optimized,
+                known_paths: vec![src_path.to_string_lossy().to_string()],
+            });
         }
 
         total_original_bytes += opt_res.validated_output.original_size;
         total_optimized_bytes += opt_res.validated_output.byte_size;
         processed_count += 1;
 
-        println!(
-            "Optimized: {} -> {} ({} -> {} bytes, {:.1}% saved, SSIM: {:.4})",
-            src_path.display(),
-            dest_path.display(),
-            opt_res.validated_output.original_size,
-            opt_res.validated_output.byte_size,
-            opt_res.validated_output.savings_ratio * 100.0,
-            opt_res.quality_score,
-        );
+        run_records.push(RunResultRecord {
+            path: src_path.to_string_lossy().to_string(),
+            status: RunItemStatus::Optimized,
+            source_sha256: Some(opt_res.source_sha256.to_hex()),
+            source_bytes: opt_res.validated_output.original_size,
+            optimized_bytes: Some(opt_res.validated_output.byte_size),
+            format: Some(opt_res.effective_format.to_string()),
+            quality_score: Some(opt_res.quality_score),
+            remote_url: None,
+            error: None,
+        });
+
+        if !args.quiet {
+            println!(
+                "Optimized: {} -> {} ({} -> {} bytes, {:.1}% saved, SSIM: {:.4})",
+                src_path.display(),
+                dest_path.display(),
+                opt_res.validated_output.original_size,
+                opt_res.validated_output.byte_size,
+                opt_res.validated_output.savings_ratio * 100.0,
+                opt_res.quality_score,
+            );
+        }
     }
 
-    let overall_saved = if total_original_bytes >= total_optimized_bytes {
-        i64::try_from(total_original_bytes - total_optimized_bytes).unwrap_or(i64::MAX)
-    } else {
-        -i64::try_from(total_optimized_bytes - total_original_bytes).unwrap_or(i64::MAX)
-    };
-    let overall_ratio = if total_original_bytes > 0 {
-        (overall_saved as f64) / (total_original_bytes as f64) * 100.0
-    } else {
-        0.0
-    };
+    if let Some(ref adapter) = manifest_adapter {
+        adapter.store.save(&adapter.manifest)?;
+    }
+
+    let elapsed_millis = start_time.elapsed().as_millis() as u64;
+    if let Some(ref json_path) = args.json {
+        let run_result = RunResult::new(run_records, elapsed_millis);
+        run_result.write_to_file(json_path)?;
+    }
+
+    let (overall_saved, raw_ratio) =
+        compute_byte_savings(total_original_bytes, total_optimized_bytes);
+    let overall_ratio = raw_ratio * 100.0;
 
     println!("\nSummary:");
     println!("  Processed: {processed_count} files");
+    if skipped_count > 0 {
+        println!("  Skipped:   {skipped_count} files");
+    }
     if failed_count > 0 {
         println!("  Failed:    {failed_count} files");
     }
@@ -594,16 +907,8 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config = build_optimization_config(OptimizationCliOptions {
-        preset: args.preset,
-        quality: args.quality,
-        effort: args.effort,
-        format: &args.format,
-        preserve_metadata: args.preserve_metadata,
-        max_width: args.max_width,
-        max_height: args.max_height,
-    })?;
-
+    let config = build_optimization_config(&args.opt, &args.format)?;
+    let scan_opts = args.filter.to_scan_options();
     let version = env!("CARGO_PKG_VERSION");
 
     let manifest_path = args.manifest.unwrap_or_else(|| {
@@ -618,33 +923,40 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut manifest_adapter = ManifestSyncAdapter::new(manifest_store, version)?;
 
     let batch_options = BatchOptions {
-        concurrency: args.concurrency.unwrap_or(4).max(1),
+        concurrency: args.filter.concurrency.unwrap_or(4).max(1),
         stop_on_error: false,
     };
 
     let sync_result: SyncRunResult = if args.dry_run {
         let bucket = args.bucket.unwrap_or_else(|| "dry-run-bucket".into());
         let storage = MemoryObjectStorage::new();
+        let cache_control = args
+            .cache_control
+            .or_else(|| Some(DEFAULT_CACHE_CONTROL.to_string()));
         let storage_adapter = StorageSyncAdapter::new(
             storage,
             args.public_url_base
                 .or_else(|| Some("https://dry-run.local".into())),
             args.prefix,
             RetryPolicy::default(),
-        );
+        )
+        .with_cache_control(cache_control);
         let sync_service = SyncService::new(version, batch_options, &bucket);
-        sync_service.run_sync(
+        sync_service.run_sync_with_options(
             &args.input,
             &config,
+            &scan_opts,
             &storage_adapter,
             &mut manifest_adapter,
         )?
     } else {
-        let s3_config = S3StorageConfig::from_env_with_overrides(
+        let s3_config = S3StorageConfig::from_env_with_cli_overrides(
             args.bucket,
             args.endpoint,
             args.prefix,
             args.public_url_base,
+            args.force_path_style,
+            args.cache_control,
         )
         .map_err(|e| format!("storage configuration failed: {e}"))?;
 
@@ -653,17 +965,23 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
         // Only emit public URLs when an explicit public URL base is configured;
         // never persist credential-bearing presigned URLs or private API endpoints.
         let public_url_base = s3_config.public_url_base.clone();
+        let cache_control = s3_config
+            .cache_control
+            .clone()
+            .or_else(|| Some(DEFAULT_CACHE_CONTROL.to_string()));
         let s3_client = S3Client::new(s3_config)?;
         let storage_adapter = StorageSyncAdapter::new(
             s3_client,
             public_url_base,
             key_prefix,
             RetryPolicy::default(),
-        );
+        )
+        .with_cache_control(cache_control);
         let sync_service = SyncService::new(version, batch_options, &bucket);
-        sync_service.run_sync(
+        sync_service.run_sync_with_options(
             &args.input,
             &config,
+            &scan_opts,
             &storage_adapter,
             &mut manifest_adapter,
         )?
@@ -699,11 +1017,13 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Optimized:        {}", sync_result.optimized_files);
     println!("  Skipped (cached): {}", sync_result.skipped_files);
     println!("  Failed:           {}", sync_result.failed_files);
-    for item in &sync_result.items {
-        if let Some(ref err) = item.error {
-            eprintln!("  - {}: {}", item.path.display(), err);
-        } else if let Some(ref url) = item.remote_url {
-            println!("  + {}: {}", item.path.display(), url);
+    if !args.quiet {
+        for item in &sync_result.items {
+            if let Some(ref err) = item.error {
+                eprintln!("  - {}: {}", item.path.display(), err);
+            } else if let Some(ref url) = item.remote_url {
+                println!("  + {}: {}", item.path.display(), url);
+            }
         }
     }
     println!("  Original bytes:  {}", sync_result.original_bytes);
@@ -714,6 +1034,14 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
         sync_result.saved_ratio * 100.0
     );
     println!("  Elapsed time:    {} ms", sync_result.elapsed_millis);
+
+    if args.fail_on_error && sync_result.failed_files > 0 {
+        return Err(format!(
+            "sync finished with {} failed file(s)",
+            sync_result.failed_files
+        )
+        .into());
+    }
 
     if sync_result.failed_files > 0
         && sync_result.optimized_files == 0
@@ -726,75 +1054,163 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let scan_res = scan_path(&args.input, &ScanOptions::default())?;
-    if scan_res.files.is_empty() {
+    let scan_opts = ScanOptions {
+        include_globs: args.include,
+        exclude_globs: args.exclude,
+        ..Default::default()
+    };
+    let scan_res = scan_path(&args.input, &scan_opts)?;
+    if scan_res.files.is_empty() && scan_res.errors.is_empty() {
         return Err(format!("no supported images found at '{}'", args.input.display()).into());
     }
 
-    let limits = ResourceLimits::default();
+    let mut limits = ResourceLimits::default();
+    if args.max_width.is_some() {
+        limits.max_width = args.max_width;
+    }
+    if args.max_height.is_some() {
+        limits.max_height = args.max_height;
+    }
+    let decode_limits = limits.to_decode_limits();
+
     let is_single_file = args.input.is_file() && scan_res.files.len() == 1;
     let mut json_entries = Vec::new();
     let mut failed_count = 0usize;
 
-    for file in &scan_res.files {
-        let inspection = read_file_bounded(&file.path, limits.max_input_bytes, PipelineStage::Discovery)
-            .and_then(|bytes| analyze_image(&bytes, Some(&limits)));
+    for scan_err in &scan_res.errors {
+        failed_count += 1;
+        if args.json {
+            json_entries.push(serde_json::json!({
+                "path": scan_err.source_path,
+                "error": scan_err.to_string(),
+            }));
+        } else {
+            eprintln!("Error scanning: {scan_err}");
+        }
+    }
 
-        match inspection {
-            Ok(analysis) => {
-                if args.json {
-                    json_entries.push(serde_json::json!({
-                        "path": file.path,
-                        "format": analysis.profile.format.as_str(),
-                        "dimensions": {
-                            "width": analysis.profile.dimensions.width,
-                            "height": analysis.profile.dimensions.height,
-                            "pixel_count": analysis.profile.dimensions.pixel_count(),
-                        },
-                        "color_type": format!("{:?}", analysis.profile.color_type),
-                        "byte_size": analysis.profile.byte_size,
-                        "characteristics": {
-                            "has_transparency": analysis.characteristics.has_transparency,
-                            "is_grayscale": analysis.characteristics.is_grayscale,
-                            "entropy_hint": analysis.characteristics.entropy_hint,
-                        },
-                        "metadata": {
-                            "has_exif": analysis.profile.metadata.has_exif,
-                            "has_icc": analysis.profile.metadata.has_icc,
-                            "has_xmp": analysis.profile.metadata.has_xmp,
+    for file in &scan_res.files {
+        let bytes_res =
+            read_file_bounded(&file.path, limits.max_input_bytes, PipelineStage::Discovery);
+        match bytes_res {
+            Ok(bytes) => {
+                // Check for animated GIF/WebP/APNG first when inspecting
+                let mut fmt_opt = None;
+                if let Ok(file_handle) = fs::File::open(&file.path) {
+                    if let Ok(fmt) = detect_format_from_reader(file_handle) {
+                        fmt_opt = Some(fmt);
+                        if matches!(fmt, ImageFormat::Gif | ImageFormat::Webp | ImageFormat::Png) {
+                            if let Ok(Some(anim)) =
+                                decode_animation_with_limits(&bytes, fmt.into(), &decode_limits)
+                            {
+                                let dims = Dimensions::new(anim.width, anim.height);
+                                if args.json {
+                                    json_entries.push(serde_json::json!({
+                                        "path": file.path,
+                                        "format": fmt.as_str(),
+                                        "animated": true,
+                                        "frames": anim.frames.len(),
+                                        "dimensions": {
+                                            "width": dims.width,
+                                            "height": dims.height,
+                                            "pixel_count": dims.pixel_count(),
+                                        },
+                                        "color_type": "Rgba8",
+                                        "byte_size": bytes.len(),
+                                    }));
+                                } else {
+                                    println!("Image: {}", file.path.display());
+                                    println!(
+                                        "  Format:       {} (animated, {} frames)",
+                                        fmt,
+                                        anim.frames.len()
+                                    );
+                                    println!(
+                                        "  Dimensions:   {}x{} ({} pixels)",
+                                        dims.width,
+                                        dims.height,
+                                        dims.pixel_count()
+                                    );
+                                    println!("  Color:        Rgba8 (4 channels)");
+                                    println!("  Size:         {} bytes", bytes.len());
+                                    println!();
+                                }
+                                continue;
+                            }
                         }
-                    }));
-                } else {
-                    println!("Image: {}", file.path.display());
-                    println!("  Format:       {}", analysis.profile.format);
-                    println!(
-                        "  Dimensions:   {}x{} ({} pixels)",
-                        analysis.profile.dimensions.width,
-                        analysis.profile.dimensions.height,
-                        analysis.profile.dimensions.pixel_count()
-                    );
-                    println!(
-                        "  Color:        {:?} ({} channels)",
-                        analysis.profile.color_type,
-                        analysis.profile.color_type.channels()
-                    );
-                    println!("  Size:         {} bytes", analysis.profile.byte_size);
-                    println!(
-                        "  Transparency: {}",
-                        analysis.characteristics.has_transparency
-                    );
-                    println!("  Grayscale:    {}", analysis.characteristics.is_grayscale);
-                    println!(
-                        "  Entropy:      {:.2} bits/byte",
-                        analysis.characteristics.entropy_hint
-                    );
-                    println!(
-                        "  Metadata:     EXIF: {}, ICC: {}, XMP: {}",
-                        analysis.profile.metadata.has_exif,
-                        analysis.profile.metadata.has_icc,
-                        analysis.profile.metadata.has_xmp
-                    );
-                    println!();
+                    }
+                }
+                let _ = fmt_opt;
+
+                match analyze_image(&bytes, Some(&limits)) {
+                    Ok(analysis) => {
+                        if args.json {
+                            json_entries.push(serde_json::json!({
+                                "path": file.path,
+                                "format": analysis.profile.format.as_str(),
+                                "animated": false,
+                                "dimensions": {
+                                    "width": analysis.profile.dimensions.width,
+                                    "height": analysis.profile.dimensions.height,
+                                    "pixel_count": analysis.profile.dimensions.pixel_count(),
+                                },
+                                "color_type": format!("{:?}", analysis.profile.color_type),
+                                "byte_size": analysis.profile.byte_size,
+                                "characteristics": {
+                                    "has_transparency": analysis.characteristics.has_transparency,
+                                    "is_grayscale": analysis.characteristics.is_grayscale,
+                                    "entropy_hint": analysis.characteristics.entropy_hint,
+                                },
+                                "metadata": {
+                                    "has_exif": analysis.profile.metadata.has_exif,
+                                    "has_icc": analysis.profile.metadata.has_icc,
+                                    "has_xmp": analysis.profile.metadata.has_xmp,
+                                }
+                            }));
+                        } else {
+                            println!("Image: {}", file.path.display());
+                            println!("  Format:       {}", analysis.profile.format);
+                            println!(
+                                "  Dimensions:   {}x{} ({} pixels)",
+                                analysis.profile.dimensions.width,
+                                analysis.profile.dimensions.height,
+                                analysis.profile.dimensions.pixel_count()
+                            );
+                            println!(
+                                "  Color:        {:?} ({} channels)",
+                                analysis.profile.color_type,
+                                analysis.profile.color_type.channels()
+                            );
+                            println!("  Size:         {} bytes", analysis.profile.byte_size);
+                            println!(
+                                "  Transparency: {}",
+                                analysis.characteristics.has_transparency
+                            );
+                            println!("  Grayscale:    {}", analysis.characteristics.is_grayscale);
+                            println!(
+                                "  Entropy:      {:.2} bits/byte",
+                                analysis.characteristics.entropy_hint
+                            );
+                            println!(
+                                "  Metadata:     EXIF: {}, ICC: {}, XMP: {}",
+                                analysis.profile.metadata.has_exif,
+                                analysis.profile.metadata.has_icc,
+                                analysis.profile.metadata.has_xmp
+                            );
+                            println!();
+                        }
+                    }
+                    Err(e) => {
+                        failed_count += 1;
+                        if args.json {
+                            json_entries.push(serde_json::json!({
+                                "path": file.path,
+                                "error": e.to_string(),
+                            }));
+                        } else {
+                            eprintln!("Error inspecting {}: {e}", file.path.display());
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -848,10 +1264,12 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .values()
                 .find_map(|e| e.storage.as_ref().map(|s| s.bucket.clone()))
         });
-        let s3_config = S3StorageConfig::from_env_with_overrides(
+        let s3_config = S3StorageConfig::from_env_with_cli_overrides(
             fallback_bucket,
             args.endpoint,
             None,
+            None,
+            args.force_path_style,
             None,
         )
         .map_err(|e| format!("storage configuration required for --check-storage: {e}"))?;
@@ -862,6 +1280,14 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut invalid_count = 0usize;
     let mut verified_count = 0usize;
+    struct PendingStorageCheck {
+        bucket: String,
+        object_key: String,
+        expected_size: u64,
+        expected_etag: Option<String>,
+        is_completed_status: bool,
+    }
+    let mut storage_checks: Vec<BatchTask<PendingStorageCheck>> = Vec::new();
 
     for (sha, entry) in &manifest.entries {
         if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -875,7 +1301,10 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if matches!(entry.status, EntryStatus::Failed | EntryStatus::Pending) {
+        if matches!(
+            entry.status,
+            EntryStatus::Failed | EntryStatus::Pending | EntryStatus::Skipped
+        ) {
             eprintln!(
                 "  [INVALID] Entry {sha} is in non-completed status: {:?}",
                 entry.status
@@ -895,55 +1324,89 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if let Some(ref client) = storage_client {
+        let is_completed_status =
+            entry.status == EntryStatus::Uploaded || entry.status == EntryStatus::Verified;
+
+        if storage_client.is_some() {
             let Some(ref st) = entry.storage else {
                 eprintln!("  [INVALID] Missing storage record for entry: {sha}");
                 invalid_count += 1;
                 continue;
             };
-            let bucket = args.bucket.as_deref().unwrap_or(&st.bucket);
-            match client.head_object(bucket, &st.object_key) {
+            let bucket = args.bucket.as_deref().unwrap_or(&st.bucket).to_string();
+            storage_checks.push(BatchTask::new(
+                &st.object_key,
+                PendingStorageCheck {
+                    bucket,
+                    object_key: st.object_key.clone(),
+                    expected_size: opt.output_size,
+                    expected_etag: st.etag.clone(),
+                    is_completed_status,
+                },
+            ));
+        } else if is_completed_status {
+            verified_count += 1;
+        }
+    }
+
+    if let Some(ref client) = storage_client {
+        let batch_opts = BatchOptions {
+            concurrency: args.concurrency.unwrap_or(8).max(1),
+            stop_on_error: false,
+        };
+        let (results, _) = execute_batch_scoped(storage_checks, &batch_opts, |_, chk| {
+            let outcome = match client.head_object(&chk.bucket, &chk.object_key) {
                 Ok(Some(meta)) => {
-                    if meta.byte_size != opt.output_size {
-                        eprintln!(
+                    if meta.byte_size != chk.expected_size {
+                        Err(format!(
                             "  [MISMATCH] Size mismatch for object {}: expected {} bytes, got {} bytes",
-                            st.object_key, opt.output_size, meta.byte_size
-                        );
-                        invalid_count += 1;
-                        continue;
-                    }
-                    if let (Some(ref expected_etag), Some(ref actual_etag)) = (&st.etag, &meta.etag)
+                            chk.object_key, chk.expected_size, meta.byte_size
+                        ))
+                    } else if let (Some(ref expected_etag), Some(ref actual_etag)) =
+                        (&chk.expected_etag, &meta.etag)
                     {
                         let norm_exp = expected_etag.trim_matches('"');
                         let norm_act = actual_etag.trim_matches('"');
                         if !norm_exp.is_empty() && !norm_act.is_empty() && norm_exp != norm_act {
-                            eprintln!(
+                            Err(format!(
                                 "  [MISMATCH] ETag mismatch for object {}: expected {norm_exp}, got {norm_act}",
-                                st.object_key
-                            );
-                            invalid_count += 1;
-                            continue;
+                                chk.object_key
+                            ))
+                        } else {
+                            Ok(chk.is_completed_status)
                         }
+                    } else {
+                        Ok(chk.is_completed_status)
                     }
                 }
-                Ok(None) => {
-                    eprintln!(
-                        "  [MISSING] Object not found in storage: {bucket}/{}",
-                        st.object_key
-                    );
+                Ok(None) => Err(format!(
+                    "  [MISSING] Object not found in storage: {}/{}",
+                    chk.bucket, chk.object_key
+                )),
+                Err(e) => Err(format!(
+                    "  [ERROR] Storage check error for {}: {e}",
+                    chk.object_key
+                )),
+            };
+            Ok(outcome)
+        });
+
+        for r in results {
+            match r.output {
+                Ok(Ok(is_completed)) => {
+                    if is_completed {
+                        verified_count += 1;
+                    }
+                }
+                Ok(Err(msg)) => {
+                    eprintln!("{msg}");
                     invalid_count += 1;
-                    continue;
                 }
                 Err(e) => {
-                    eprintln!("  [ERROR] Storage check error for {}: {e}", st.object_key);
+                    eprintln!("  [ERROR] {e}");
                     invalid_count += 1;
-                    continue;
                 }
             }
-        }
-
-        if entry.status == EntryStatus::Uploaded || entry.status == EntryStatus::Verified {
-            verified_count += 1;
         }
     }
 
@@ -959,21 +1422,15 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_benchmark_cmd(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let config = build_optimization_config(OptimizationCliOptions {
-        preset: args.preset,
-        quality: args.quality,
-        effort: args.effort,
-        format: &args.format,
-        preserve_metadata: args.preserve_metadata,
-        max_width: args.max_width,
-        max_height: args.max_height,
-    })?;
+    let config = build_optimization_config(&args.opt, &args.format)?;
+    let scan_opts = args.filter.to_scan_options();
 
     let concurrency = args
+        .filter
         .concurrency
         .unwrap_or_else(|| BatchOptions::default().concurrency)
         .max(1);
-    let report = run_benchmark_with_concurrency(&args.dataset, &config, concurrency)?;
+    let report = run_benchmark_with_options(&args.dataset, &config, concurrency, &scan_opts)?;
 
     if let Some(ref json_path) = args.json {
         let json_str = report.to_json_pretty()?;
@@ -1005,6 +1462,129 @@ fn run_benchmark_cmd(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         "  Elapsed time:       {} ms",
         report.summary.total_elapsed_millis
     );
+
+    if report.summary.total_cases == 0 {
+        return Err(format!("no supported images found at '{}'", args.dataset.display()).into());
+    }
+    if args.fail_on_error && report.summary.failed_cases > 0 {
+        return Err(format!(
+            "benchmark finished with {} failed case(s)",
+            report.summary.failed_cases
+        )
+        .into());
+    }
+    if report.summary.failed_cases > 0 && report.summary.successful_cases == 0 {
+        return Err("all benchmark cases failed".into());
+    }
+
+    Ok(())
+}
+
+fn run_gc(args: GcArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = args
+        .manifest
+        .unwrap_or_else(|| PathBuf::from(".imgopt-manifest.json"));
+    let store = ManifestStore::new(&manifest_path);
+    let manifest = store.load()?;
+
+    let fallback_bucket = args.bucket.clone().or_else(|| {
+        manifest
+            .entries
+            .values()
+            .find_map(|e| e.storage.as_ref().map(|s| s.bucket.clone()))
+    });
+
+    let s3_config = S3StorageConfig::from_env_with_cli_overrides(
+        fallback_bucket,
+        args.endpoint,
+        args.prefix,
+        None,
+        args.force_path_style,
+        None,
+    )
+    .map_err(|e| format!("storage configuration required for gc: {e}"))?;
+
+    let bucket = s3_config.bucket.clone();
+    let scan_prefix = match s3_config.key_prefix.as_deref() {
+        Some(p) if !p.trim().is_empty() => {
+            format!("{}/images/", p.trim().trim_matches('/'))
+        }
+        _ => "images/".to_string(),
+    };
+    let client = S3Client::new(s3_config)?;
+
+    let active_keys: HashSet<String> = manifest
+        .entries
+        .values()
+        .filter_map(|e| e.storage.as_ref())
+        .filter(|st| st.bucket == bucket)
+        .map(|st| st.object_key.clone())
+        .collect();
+
+    let remote_objects = client.list_objects(&bucket, Some(&scan_prefix))?;
+    let mut orphan_keys = Vec::new();
+    let mut orphan_bytes = 0u64;
+
+    for obj in &remote_objects {
+        if !active_keys.contains(&obj.object_key) {
+            orphan_keys.push(obj.object_key.clone());
+            orphan_bytes = orphan_bytes.saturating_add(obj.byte_size);
+        }
+    }
+
+    let mut deleted_keys = Vec::new();
+    let mut delete_errors = Vec::new();
+    if args.delete {
+        for key in &orphan_keys {
+            match client.delete_object(&bucket, key) {
+                Ok(()) => deleted_keys.push(key.clone()),
+                Err(e) => delete_errors.push(format!("{key}: {e}")),
+            }
+        }
+    }
+
+    if let Some(ref json_path) = args.json {
+        let report = serde_json::json!({
+            "bucket": bucket,
+            "prefix": scan_prefix,
+            "dry_run": !args.delete,
+            "remote_objects": remote_objects.len(),
+            "active_manifest_keys": active_keys.len(),
+            "orphaned_objects": orphan_keys,
+            "orphaned_bytes": orphan_bytes,
+            "deleted_objects": deleted_keys,
+            "errors": delete_errors,
+        });
+        write_atomically(json_path, serde_json::to_string_pretty(&report)?.as_bytes())?;
+    }
+
+    println!(
+        "GC Summary ({}):",
+        if args.delete { "DELETE" } else { "DRY RUN" }
+    );
+    println!("  Bucket:            {bucket}");
+    println!("  Scanned prefix:    {scan_prefix}");
+    println!("  Remote objects:    {}", remote_objects.len());
+    println!("  Active in manifest:{}", active_keys.len());
+    println!(
+        "  Orphaned objects:  {} ({orphan_bytes} bytes)",
+        orphan_keys.len()
+    );
+    if args.delete {
+        println!("  Deleted objects:   {}", deleted_keys.len());
+    } else if !orphan_keys.is_empty() {
+        for key in &orphan_keys {
+            println!("  [ORPHAN] {key}");
+        }
+        println!("  Re-run with --delete to remove orphaned objects.");
+    }
+
+    if !delete_errors.is_empty() {
+        for err in &delete_errors {
+            eprintln!("  [ERROR] {err}");
+        }
+        return Err(format!("gc failed to delete {} object(s)", delete_errors.len()).into());
+    }
 
     Ok(())
 }

@@ -161,6 +161,14 @@ mod tests {
         fn delete_object(&self, _bucket: &str, _object_key: &str) -> Result<(), StorageError> {
             Ok(())
         }
+
+        fn list_objects(
+            &self,
+            _bucket: &str,
+            _prefix: Option<&str>,
+        ) -> Result<Vec<crate::interface::ListedObject>, StorageError> {
+            Ok(Vec::new())
+        }
     }
 
     #[test]

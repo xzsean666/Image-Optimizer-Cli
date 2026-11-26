@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::{OptimizationConfig, OutputFormatPolicy};
-use crate::detect::detect_format_from_reader;
-use crate::error::{ErrorKind, ImgoptError, PipelineStage, Result};
+use crate::detect::{detect_format, MAX_HEADER_PROBE_BYTES};
+use crate::error::Result;
 use crate::executor::{execute_batch_scoped, BatchOptions, BatchTask};
-use crate::hash::{hash_bytes, hash_file, Sha256Digest};
-use crate::model::ImageFormat;
+use crate::hash::{hash_bytes, Sha256Digest, HASH_BUFFER_SIZE};
+use crate::model::{compute_byte_savings, ImageFormat};
 use crate::optimization_key::OptimizationKey;
 use crate::optimizer::{OptimizationResult, OptimizationService};
 use crate::scanner::{scan_path, ScanOptions};
@@ -62,6 +64,15 @@ pub struct SyncStorageOutput {
 /// Abstract contract for manifest lookup, state transitions, and atomic commit.
 pub trait SyncManifest: Send + Sync {
     fn evaluate(&self, source_sha256: &str, current_opt_key: &str) -> SyncPlanAction;
+    fn evaluate_for_target(
+        &self,
+        source_sha256: &str,
+        current_opt_key: &str,
+        _bucket: &str,
+        _expected_object_key: Option<&str>,
+    ) -> SyncPlanAction {
+        self.evaluate(source_sha256, current_opt_key)
+    }
     fn record_success(
         &mut self,
         source_path: &str,
@@ -126,12 +137,122 @@ struct IntraBatchDup {
     byte_size: u64,
 }
 
-struct WorkerOutcome {
-    item_index: usize,
-    source_sha: Sha256Digest,
+enum WorkerOutcome {
+    Succeeded {
+        item_index: usize,
+        source_sha: Sha256Digest,
+        byte_size: u64,
+        opt_res: Box<OptimizationResult>,
+        storage_out: SyncStorageOutput,
+    },
+    Failed {
+        item_index: usize,
+        source_sha: Sha256Digest,
+        sha_hex: String,
+        byte_size: u64,
+        error: String,
+    },
+}
+
+struct PreflightSuccess {
     byte_size: u64,
-    opt_res: OptimizationResult,
-    storage_out: SyncStorageOutput,
+    source_sha: Sha256Digest,
+    format: ImageFormat,
+}
+
+struct PreflightError {
+    byte_size: u64,
+    source_sha: Option<Sha256Digest>,
+    error: String,
+}
+
+type PrimaryOutcomeMap =
+    HashMap<String, std::result::Result<(u64, ImageFormat, Option<String>), String>>;
+
+/// Single-open bounded streaming preflight: reads file size, hashes payload, and detects format.
+fn preflight_hash_and_detect(
+    path: &Path,
+    max_input_bytes: u64,
+) -> std::result::Result<PreflightSuccess, PreflightError> {
+    let mut file = File::open(path).map_err(|e| PreflightError {
+        byte_size: 0,
+        source_sha: None,
+        error: format!("failed to open file: {e}"),
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| PreflightError {
+            byte_size: 0,
+            source_sha: None,
+            error: format!("failed to read file metadata: {e}"),
+        })?
+        .len();
+
+    if file_len > max_input_bytes {
+        return Err(PreflightError {
+            byte_size: file_len,
+            source_sha: None,
+            error: format!(
+                "input size {} bytes exceeds configured limit of {} bytes",
+                file_len, max_input_bytes
+            ),
+        });
+    }
+
+    let mut hasher = Sha256::new();
+    let mut header = [0u8; MAX_HEADER_PROBE_BYTES];
+    let mut header_len = 0usize;
+    let mut buf = [0u8; HASH_BUFFER_SIZE];
+    let mut total_read = 0u64;
+
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                total_read = total_read.saturating_add(n as u64);
+                if total_read > max_input_bytes {
+                    return Err(PreflightError {
+                        byte_size: total_read,
+                        source_sha: None,
+                        error: format!(
+                            "input size {} bytes exceeds configured limit of {} bytes",
+                            total_read, max_input_bytes
+                        ),
+                    });
+                }
+                if header_len < MAX_HEADER_PROBE_BYTES {
+                    let take = (MAX_HEADER_PROBE_BYTES - header_len).min(n);
+                    header[header_len..header_len + take].copy_from_slice(&buf[..take]);
+                    header_len += take;
+                }
+                hasher.update(&buf[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(PreflightError {
+                    byte_size: file_len,
+                    source_sha: None,
+                    error: format!("failed to read file during hashing: {e}"),
+                })
+            }
+        }
+    }
+
+    let mut digest_bytes = [0u8; 32];
+    digest_bytes.copy_from_slice(&hasher.finalize());
+    let source_sha = Sha256Digest::from_bytes(digest_bytes);
+
+    let format = detect_format(&header[..header_len]).map_err(|e| PreflightError {
+        byte_size: total_read,
+        source_sha: Some(source_sha),
+        error: format!("format detection failed: {e}"),
+    })?;
+
+    Ok(PreflightSuccess {
+        byte_size: total_read,
+        source_sha,
+        format,
+    })
 }
 
 /// Orchestrates recursive scanning, streaming hashing, deduplication, bounded parallel optimization,
@@ -175,11 +296,28 @@ impl SyncService {
         storage: &S,
         manifest: &mut M,
     ) -> Result<SyncRunResult> {
+        self.run_sync_with_options(
+            input_path,
+            config,
+            &ScanOptions::default(),
+            storage,
+            manifest,
+        )
+    }
+
+    pub fn run_sync_with_options<S: SyncStorage, M: SyncManifest>(
+        &self,
+        input_path: &Path,
+        config: &OptimizationConfig,
+        scan_options: &ScanOptions,
+        storage: &S,
+        manifest: &mut M,
+    ) -> Result<SyncRunResult> {
         let start_time = Instant::now();
         config.validate()?;
 
-        let scan_res = scan_path(input_path, &ScanOptions::default())?;
-        if scan_res.files.is_empty() {
+        let scan_res = scan_path(input_path, scan_options)?;
+        if scan_res.files.is_empty() && scan_res.errors.is_empty() {
             return Ok(SyncRunResult {
                 total_files: 0,
                 optimized_files: 0,
@@ -194,34 +332,65 @@ impl SyncService {
             });
         }
 
-        let total_files = scan_res.files.len();
-        let mut items: Vec<Option<SyncItemResult>> = vec![None; total_files];
+        let discovered_count = scan_res.files.len();
+        let mut items: Vec<Option<SyncItemResult>> = vec![None; discovered_count];
         let mut total_original = 0u64;
         let mut total_optimized = 0u64;
         let mut optimized_count = 0usize;
         let mut skipped_count = 0usize;
         let mut failed_count = 0usize;
 
+        let mut scan_failed_items = Vec::with_capacity(scan_res.errors.len());
+        for scan_err in &scan_res.errors {
+            let err_path = scan_err
+                .source_path
+                .clone()
+                .unwrap_or_else(|| input_path.to_path_buf());
+            let err_msg = scan_err.to_string();
+            manifest.record_failure(&err_path.to_string_lossy(), None, &err_msg);
+            failed_count += 1;
+            scan_failed_items.push(SyncItemResult {
+                path: err_path,
+                source_sha256: None,
+                status: SyncItemStatus::Failed,
+                source_bytes: 0,
+                optimized_bytes: None,
+                format: None,
+                quality_score: None,
+                remote_url: None,
+                error: Some(err_msg),
+            });
+        }
+
         let mut pending_tasks: Vec<BatchTask<PendingAssetWork>> = Vec::new();
         let mut scheduled_shas: HashMap<String, usize> = HashMap::new();
         let mut intra_batch_dups: Vec<IntraBatchDup> = Vec::new();
 
-        // Phase 1: Preflight size check, streaming SHA-256 hashing, and deduplication planning.
-        // Skipped files never load image payloads into memory.
+        // Phase 1: Single-open preflight size check, streaming SHA-256 hashing, format detection,
+        // and target-aware deduplication planning. Skipped files never load image payloads into memory.
         for (idx, discovered) in scan_res.files.iter().enumerate() {
             let path_str = discovered.path.to_string_lossy().to_string();
 
-            let file_len = match File::open(&discovered.path).and_then(|f| f.metadata()) {
-                Ok(m) => m.len(),
-                Err(e) => {
+            let PreflightSuccess {
+                byte_size: file_len,
+                source_sha,
+                format: detected_fmt,
+            } = match preflight_hash_and_detect(&discovered.path, config.max_input_bytes) {
+                Ok(ok) => ok,
+                Err(PreflightError {
+                    byte_size: size,
+                    source_sha: sha_opt,
+                    error: err_msg,
+                }) => {
+                    total_original += size;
                     failed_count += 1;
-                    let err_msg = format!("failed to read file metadata: {e}");
-                    manifest.record_failure(&path_str, None, &err_msg);
+                    let sha_hex_opt = sha_opt.as_ref().map(Sha256Digest::to_hex);
+                    manifest.record_failure(&path_str, sha_hex_opt.as_deref(), &err_msg);
                     items[idx] = Some(SyncItemResult {
                         path: discovered.path.clone(),
-                        source_sha256: None,
+                        source_sha256: sha_opt,
                         status: SyncItemStatus::Failed,
-                        source_bytes: discovered.byte_size,
+                        source_bytes: if size > 0 { size } else { discovered.byte_size },
                         optimized_bytes: None,
                         format: None,
                         quality_score: None,
@@ -233,78 +402,7 @@ impl SyncService {
             };
 
             total_original += file_len;
-
-            if file_len > config.max_input_bytes {
-                failed_count += 1;
-                let err_msg = format!(
-                    "input size {} bytes exceeds configured limit of {} bytes",
-                    file_len, config.max_input_bytes
-                );
-                manifest.record_failure(&path_str, None, &err_msg);
-                items[idx] = Some(SyncItemResult {
-                    path: discovered.path.clone(),
-                    source_sha256: None,
-                    status: SyncItemStatus::Failed,
-                    source_bytes: file_len,
-                    optimized_bytes: None,
-                    format: None,
-                    quality_score: None,
-                    remote_url: None,
-                    error: Some(err_msg),
-                });
-                continue;
-            }
-
-            let source_sha = match hash_file(&discovered.path) {
-                Ok(digest) => digest,
-                Err(e) => {
-                    failed_count += 1;
-                    let err_msg = format!("failed to hash file: {e}");
-                    manifest.record_failure(&path_str, None, &err_msg);
-                    items[idx] = Some(SyncItemResult {
-                        path: discovered.path.clone(),
-                        source_sha256: None,
-                        status: SyncItemStatus::Failed,
-                        source_bytes: file_len,
-                        optimized_bytes: None,
-                        format: None,
-                        quality_score: None,
-                        remote_url: None,
-                        error: Some(err_msg),
-                    });
-                    continue;
-                }
-            };
             let sha_str = source_sha.to_hex();
-
-            let detected_fmt = match File::open(&discovered.path)
-                .map_err(|e| {
-                    ImgoptError::new(
-                        PipelineStage::FormatDetection,
-                        ErrorKind::Io(e.to_string()),
-                    )
-                })
-                .and_then(detect_format_from_reader)
-            {
-                Ok(fmt) => fmt,
-                Err(e) => {
-                    failed_count += 1;
-                    let err_msg = format!("format detection failed: {e}");
-                    manifest.record_failure(&path_str, Some(&sha_str), &err_msg);
-                    items[idx] = Some(SyncItemResult {
-                        path: discovered.path.clone(),
-                        source_sha256: Some(source_sha),
-                        status: SyncItemStatus::Failed,
-                        source_bytes: file_len,
-                        optimized_bytes: None,
-                        format: None,
-                        quality_score: None,
-                        remote_url: None,
-                        error: Some(err_msg),
-                    });
-                    continue;
-                }
-            };
 
             let expected_format = match config.output_format_policy {
                 OutputFormatPolicy::Force(fmt) => fmt,
@@ -317,21 +415,42 @@ impl SyncService {
                 expected_format,
                 config,
             );
+            let expected_obj_key = storage.derive_object_key(&sha_str, expected_format).ok();
 
-            let mut action = manifest.evaluate(&sha_str, opt_key.as_str());
-            if config.output_format_policy == OutputFormatPolicy::AllowWebp
-                && expected_format != ImageFormat::Webp
-                && !matches!(action, SyncPlanAction::SkipUpToDate { .. })
-            {
-                let opt_key_webp = OptimizationKey::compute(
+            let mut action = manifest.evaluate_for_target(
+                &sha_str,
+                opt_key.as_str(),
+                &self.bucket,
+                expected_obj_key.as_deref(),
+            );
+            let fallback_candidates: &[ImageFormat] = match config.output_format_policy {
+                OutputFormatPolicy::AllowWebp => &[ImageFormat::Webp],
+                OutputFormatPolicy::AllowAvif => &[ImageFormat::Avif],
+                OutputFormatPolicy::Auto => &[ImageFormat::Webp, ImageFormat::Avif],
+                _ => &[],
+            };
+            for &alt_fmt in fallback_candidates {
+                if alt_fmt == expected_format
+                    || matches!(action, SyncPlanAction::SkipUpToDate { .. })
+                {
+                    continue;
+                }
+                let alt_opt_key = OptimizationKey::compute(
                     &source_sha,
                     self.optimizer.optimizer_version(),
-                    ImageFormat::Webp,
+                    alt_fmt,
                     config,
                 );
-                let webp_action = manifest.evaluate(&sha_str, opt_key_webp.as_str());
-                if matches!(webp_action, SyncPlanAction::SkipUpToDate { .. }) {
-                    action = webp_action;
+                let alt_obj_key = storage.derive_object_key(&sha_str, alt_fmt).ok();
+                let alt_action = manifest.evaluate_for_target(
+                    &sha_str,
+                    alt_opt_key.as_str(),
+                    &self.bucket,
+                    alt_obj_key.as_deref(),
+                );
+                if matches!(alt_action, SyncPlanAction::SkipUpToDate { .. }) {
+                    action = alt_action;
+                    break;
                 }
             }
 
@@ -345,6 +464,11 @@ impl SyncService {
                     manifest.record_path_alias(&sha_str, &path_str);
                     skipped_count += 1;
                     total_optimized += optimized_bytes;
+                    let resolved_url = storage
+                        .derive_object_key(&sha_str, format)
+                        .ok()
+                        .and_then(|k| storage.build_public_url(&k))
+                        .or(storage_url);
                     items[idx] = Some(SyncItemResult {
                         path: discovered.path.clone(),
                         source_sha256: Some(source_sha),
@@ -353,7 +477,7 @@ impl SyncService {
                         optimized_bytes: Some(optimized_bytes),
                         format: Some(format),
                         quality_score: None,
-                        remote_url: storage_url,
+                        remote_url: resolved_url,
                         error: None,
                     });
                 }
@@ -383,11 +507,13 @@ impl SyncService {
         }
 
         // Phase 2: Bounded concurrent optimization + upload verification in checkpointed waves.
-        let wave_size = self.batch_options.concurrency.max(1).saturating_mul(4).max(4);
-        let mut primary_outcomes: HashMap<
-            String,
-            std::result::Result<(u64, ImageFormat, Option<String>), String>,
-        > = HashMap::new();
+        let wave_size = self
+            .batch_options
+            .concurrency
+            .max(1)
+            .saturating_mul(4)
+            .max(4);
+        let mut primary_outcomes: PrimaryOutcomeMap = HashMap::new();
 
         let mut remaining = pending_tasks;
         while !remaining.is_empty() {
@@ -396,92 +522,106 @@ impl SyncService {
 
             let (wave_results, _summary) =
                 execute_batch_scoped(wave, &self.batch_options, |path, work| {
-                    let opt_res = self.optimizer.optimize_file(&path, config)?;
-                    let object_key =
-                        storage.derive_object_key(&work.sha_hex, opt_res.effective_format)?;
-                    let content_type = opt_res.effective_format.mime_type();
-                    let opt_sha = hash_bytes(&opt_res.validated_output.bytes).to_hex();
-                    let storage_out = storage.upload_and_verify(
-                        &self.bucket,
-                        &object_key,
-                        &opt_res.validated_output.bytes,
-                        content_type,
-                        Some(&opt_sha),
-                    )?;
+                    let item_index = work.item_index;
+                    let source_sha = work.source_sha;
+                    let sha_hex = work.sha_hex;
+                    let byte_size = work.byte_size;
 
-                    Ok(WorkerOutcome {
-                        item_index: work.item_index,
-                        source_sha: work.source_sha,
-                        byte_size: work.byte_size,
-                        opt_res,
-                        storage_out,
+                    let work_res: Result<(OptimizationResult, SyncStorageOutput)> = (|| {
+                        let opt_res = self.optimizer.optimize_file(&path, config)?;
+                        let object_key =
+                            storage.derive_object_key(&sha_hex, opt_res.effective_format)?;
+                        let content_type = opt_res.effective_format.mime_type();
+                        let opt_sha = hash_bytes(&opt_res.validated_output.bytes).to_hex();
+                        let storage_out = storage.upload_and_verify(
+                            &self.bucket,
+                            &object_key,
+                            &opt_res.validated_output.bytes,
+                            content_type,
+                            Some(&opt_sha),
+                        )?;
+                        Ok((opt_res, storage_out))
+                    })(
+                    );
+
+                    Ok(match work_res {
+                        Ok((opt_res, storage_out)) => WorkerOutcome::Succeeded {
+                            item_index,
+                            source_sha,
+                            byte_size,
+                            opt_res: Box::new(opt_res),
+                            storage_out,
+                        },
+                        Err(e) => WorkerOutcome::Failed {
+                            item_index,
+                            source_sha,
+                            sha_hex,
+                            byte_size,
+                            error: e.to_string(),
+                        },
                     })
                 });
 
             for res in wave_results {
                 let path_str = res.source_path.to_string_lossy().to_string();
                 match res.output {
-                    Ok(outcome) => {
-                        let sha_hex = outcome.source_sha.to_hex();
-                        manifest.record_success(
-                            &path_str,
-                            &outcome.opt_res,
-                            &outcome.storage_out,
-                        );
+                    Ok(WorkerOutcome::Succeeded {
+                        item_index,
+                        source_sha,
+                        byte_size,
+                        opt_res,
+                        storage_out,
+                    }) => {
+                        let sha_hex = source_sha.to_hex();
+                        manifest.record_success(&path_str, &opt_res, &storage_out);
                         optimized_count += 1;
-                        total_optimized += outcome.opt_res.validated_output.byte_size;
+                        total_optimized += opt_res.validated_output.byte_size;
                         primary_outcomes.insert(
                             sha_hex,
                             Ok((
-                                outcome.opt_res.validated_output.byte_size,
-                                outcome.opt_res.effective_format,
-                                outcome.storage_out.public_url.clone(),
+                                opt_res.validated_output.byte_size,
+                                opt_res.effective_format,
+                                storage_out.public_url.clone(),
                             )),
                         );
-                        items[outcome.item_index] = Some(SyncItemResult {
+                        items[item_index] = Some(SyncItemResult {
                             path: res.source_path,
-                            source_sha256: Some(outcome.source_sha),
+                            source_sha256: Some(source_sha),
                             status: SyncItemStatus::Optimized,
-                            source_bytes: outcome.byte_size,
-                            optimized_bytes: Some(outcome.opt_res.validated_output.byte_size),
-                            format: Some(outcome.opt_res.effective_format),
-                            quality_score: Some(outcome.opt_res.quality_score),
-                            remote_url: outcome.storage_out.public_url,
+                            source_bytes: byte_size,
+                            optimized_bytes: Some(opt_res.validated_output.byte_size),
+                            format: Some(opt_res.effective_format),
+                            quality_score: Some(opt_res.quality_score),
+                            remote_url: storage_out.public_url,
                             error: None,
+                        });
+                    }
+                    Ok(WorkerOutcome::Failed {
+                        item_index,
+                        source_sha,
+                        sha_hex,
+                        byte_size,
+                        error,
+                    }) => {
+                        manifest.record_failure(&path_str, Some(&sha_hex), &error);
+                        failed_count += 1;
+                        primary_outcomes.insert(sha_hex, Err(error.clone()));
+                        items[item_index] = Some(SyncItemResult {
+                            path: res.source_path,
+                            source_sha256: Some(source_sha),
+                            status: SyncItemStatus::Failed,
+                            source_bytes: byte_size,
+                            optimized_bytes: None,
+                            format: None,
+                            quality_score: None,
+                            remote_url: None,
+                            error: Some(error),
                         });
                     }
                     Err(e) => {
                         let err_msg = e.to_string();
-                        let meta = std::fs::metadata(&res.source_path).ok();
-                        let file_len = meta.map(|m| m.len()).unwrap_or(0);
-                        let sha_opt = hash_file(&res.source_path).ok();
-                        let sha_hex_opt = sha_opt.as_ref().map(Sha256Digest::to_hex);
-
-                        manifest.record_failure(&path_str, sha_hex_opt.as_deref(), &err_msg);
+                        manifest.record_failure(&path_str, None, &err_msg);
                         failed_count += 1;
-                        if let Some(ref sha_hex) = sha_hex_opt {
-                            primary_outcomes.insert(sha_hex.clone(), Err(err_msg.clone()));
-                        }
-
-                        if let Some(target_idx) = scan_res
-                            .files
-                            .iter()
-                            .enumerate()
-                            .find(|(i, f)| f.path == res.source_path && items[*i].is_none())
-                            .map(|(i, _)| i)
-                        {
-                            items[target_idx] = Some(SyncItemResult {
-                                path: res.source_path,
-                                source_sha256: sha_opt,
-                                status: SyncItemStatus::Failed,
-                                source_bytes: file_len,
-                                optimized_bytes: None,
-                                format: None,
-                                quality_score: None,
-                                remote_url: None,
-                                error: Some(err_msg),
-                            });
-                        }
                     }
                 }
             }
@@ -547,7 +687,7 @@ impl SyncService {
         // Final atomic commit (captures skipped path aliases and final state)
         manifest.commit()?;
 
-        let final_items: Vec<SyncItemResult> = items
+        let mut final_items: Vec<SyncItemResult> = items
             .into_iter()
             .enumerate()
             .map(|(idx, slot)| {
@@ -564,17 +704,11 @@ impl SyncService {
                 })
             })
             .collect();
+        final_items.extend(scan_failed_items);
+        let total_files = final_items.len();
 
-        let saved_bytes = if total_original >= total_optimized {
-            i64::try_from(total_original - total_optimized).unwrap_or(i64::MAX)
-        } else {
-            -i64::try_from(total_optimized - total_original).unwrap_or(i64::MAX)
-        };
-        let saved_ratio = if total_original > 0 && saved_bytes > 0 {
-            saved_bytes as f64 / total_original as f64
-        } else {
-            0.0
-        };
+        let (saved_bytes, raw_ratio) = compute_byte_savings(total_original, total_optimized);
+        let saved_ratio = if saved_bytes > 0 { raw_ratio } else { 0.0 };
 
         Ok(SyncRunResult {
             total_files,

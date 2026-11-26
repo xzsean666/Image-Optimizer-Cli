@@ -7,12 +7,13 @@ use url::Url;
 
 use crate::config::S3StorageConfig;
 use crate::interface::{
-    ObjectMetadata, ObjectStorage, StorageError, UploadRequest, UploadResponse,
+    ListedObject, ObjectMetadata, ObjectStorage, StorageError, UploadRequest, UploadResponse,
 };
 
 type HmacSha256 = Hmac<Sha256>;
 
 const MAX_ERROR_BODY_BYTES: u64 = 4096;
+const MAX_LIST_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
@@ -28,8 +29,12 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// AWS SigV4 RFC 3986 URI encoding (`A-Za-z0-9-_.~`, optionally keeping `/`).
 fn sigv4_uri_encode(input: &str, encode_slash: bool) -> String {
+    sigv4_uri_encode_bytes(input.as_bytes(), encode_slash)
+}
+
+fn sigv4_uri_encode_bytes(input: &[u8], encode_slash: bool) -> String {
     let mut out = String::with_capacity(input.len());
-    for &b in input.as_bytes() {
+    for &b in input {
         let is_unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
         if is_unreserved || (!encode_slash && b == b'/') {
             out.push(b as char);
@@ -39,6 +44,49 @@ fn sigv4_uri_encode(input: &str, encode_slash: bool) -> String {
         }
     }
     out
+}
+
+fn percent_decode_to_bytes(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+fn validate_bucket_and_key(bucket: &str, object_key: &str) -> Result<(), StorageError> {
+    let clean_bucket = bucket.trim();
+    if clean_bucket.is_empty()
+        || clean_bucket.contains("..")
+        || clean_bucket.chars().any(|c| {
+            c.is_ascii_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#' | '@')
+        })
+    {
+        return Err(StorageError::InvalidParameter("invalid bucket name".into()));
+    }
+    let clean_key = object_key.trim_start_matches('/');
+    if clean_key.is_empty()
+        || clean_key.contains("..")
+        || clean_key
+            .chars()
+            .any(|c| c.is_ascii_control() || matches!(c, '\\' | '?' | '#'))
+    {
+        return Err(StorageError::InvalidParameter("invalid object_key".into()));
+    }
+    Ok(())
 }
 
 fn read_bounded_error_body(resp: ureq::Response) -> String {
@@ -60,9 +108,9 @@ fn map_transport_error(err: ureq::Transport) -> StorageError {
         | ureq::ErrorKind::InsecureRequestHttpsOnly => {
             StorageError::InvalidParameter(format!("HTTP configuration/redirect error: {msg}"))
         }
-        ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns | ureq::ErrorKind::ProxyConnect => {
-            StorageError::Network(format!("Network error: {msg}"))
-        }
+        ureq::ErrorKind::ConnectionFailed
+        | ureq::ErrorKind::Dns
+        | ureq::ErrorKind::ProxyConnect => StorageError::Network(format!("Network error: {msg}")),
         ureq::ErrorKind::ProxyUnauthorized => {
             StorageError::AuthenticationFailed(format!("Proxy auth error: {msg}"))
         }
@@ -128,51 +176,66 @@ impl S3Client {
 
     /// Build the target URL for an object according to endpoint and path style settings.
     pub fn build_url(&self, bucket: &str, object_key: &str) -> String {
-        let clean_key = object_key.trim_start_matches('/');
+        let clean_key = sigv4_uri_encode(object_key.trim_start_matches('/'), false);
+        self.build_bucket_url(bucket, &clean_key)
+    }
+
+    fn build_bucket_url(&self, bucket: &str, encoded_suffix: &str) -> String {
+        let encoded_bucket = sigv4_uri_encode(bucket.trim(), true);
+        let suffix = encoded_suffix.trim_start_matches('/');
         if let Some(ref endpoint) = self.config.endpoint {
             let clean_endpoint = endpoint.trim_end_matches('/');
-            if self.config.force_path_style {
-                format!("{clean_endpoint}/{bucket}/{clean_key}")
-            } else if let Ok(mut parsed) = Url::parse(clean_endpoint) {
-                if let Some(host) = parsed.host_str().map(ToString::to_string) {
-                    let vhost = format!("{bucket}.{host}");
-                    let _ = parsed.set_host(Some(&vhost));
+            if !self.config.force_path_style {
+                if let Ok(mut parsed) = Url::parse(clean_endpoint) {
+                    if let Some(url::Host::Domain(host)) = parsed.host().map(|h| h.to_owned()) {
+                        let vhost = format!("{}.{host}", bucket.trim());
+                        if parsed.set_host(Some(&vhost)).is_ok() {
+                            let base_path = parsed.path().trim_end_matches('/');
+                            let base = format!(
+                                "{}://{}{}",
+                                parsed.scheme(),
+                                parsed.host_str().unwrap_or_default(),
+                                parsed.port().map(|p| format!(":{p}")).unwrap_or_default()
+                            );
+                            return if base_path.is_empty() {
+                                format!("{base}/{suffix}")
+                            } else {
+                                format!("{base}{base_path}/{suffix}")
+                            };
+                        }
+                    }
                 }
-                let base_path = parsed.path().trim_end_matches('/');
-                let base = format!(
-                    "{}://{}{}",
-                    parsed.scheme(),
-                    parsed.host_str().unwrap_or_default(),
-                    parsed.port().map(|p| format!(":{p}")).unwrap_or_default()
-                );
-                if base_path.is_empty() {
-                    format!("{base}/{clean_key}")
-                } else {
-                    format!("{base}{base_path}/{clean_key}")
-                }
-            } else {
-                format!("{clean_endpoint}/{bucket}/{clean_key}")
             }
+            format!("{clean_endpoint}/{encoded_bucket}/{suffix}")
         } else if self.config.force_path_style {
             format!(
                 "https://s3.{}.amazonaws.com/{}/{}",
-                self.config.region, bucket, clean_key
+                self.config.region, encoded_bucket, suffix
             )
         } else {
             format!(
                 "https://{}.s3.{}.amazonaws.com/{}",
-                bucket, self.config.region, clean_key
+                bucket.trim(),
+                self.config.region,
+                suffix
             )
         }
     }
 
-    /// Generate a presigned GET URL valid for `expires_seconds`.
+    /// Generate a presigned GET URL valid for `expires_seconds` (1..=604800).
     pub fn generate_presigned_url(
         &self,
         bucket: &str,
         object_key: &str,
         expires_seconds: u64,
     ) -> Result<String, StorageError> {
+        validate_bucket_and_key(bucket, object_key)?;
+        if expires_seconds == 0 || expires_seconds > 604_800 {
+            return Err(StorageError::InvalidParameter(
+                "presigned URL expires_seconds must be between 1 and 604800 (7 days)".into(),
+            ));
+        }
+
         let target_url = self.build_url(bucket, object_key);
         let parsed_url = Url::parse(&target_url)
             .map_err(|e| StorageError::InvalidParameter(format!("invalid target URL: {e}")))?;
@@ -216,7 +279,8 @@ impl S3Client {
             .collect::<Vec<_>>()
             .join("&");
 
-        let canonical_uri = sigv4_uri_encode(parsed_url.path(), false);
+        let decoded_path = percent_decode_to_bytes(parsed_url.path());
+        let canonical_uri = sigv4_uri_encode_bytes(&decoded_path, false);
         let canonical_headers = format!("host:{host_header}\n");
         let signed_headers = "host";
         let payload_hash = "UNSIGNED-PAYLOAD";
@@ -252,9 +316,22 @@ impl S3Client {
         object_key: &str,
         body: &[u8],
         content_type: Option<&str>,
+        cache_control: Option<&str>,
     ) -> Result<(String, Vec<(String, String)>), StorageError> {
+        validate_bucket_and_key(bucket, object_key)?;
         let target_url = self.build_url(bucket, object_key);
-        let parsed_url = Url::parse(&target_url)
+        self.sign_headers_for_url(method, &target_url, body, content_type, cache_control)
+    }
+
+    fn sign_headers_for_url(
+        &self,
+        method: &str,
+        target_url: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+        cache_control: Option<&str>,
+    ) -> Result<(String, Vec<(String, String)>), StorageError> {
+        let parsed_url = Url::parse(target_url)
             .map_err(|e| StorageError::InvalidParameter(format!("invalid target URL: {e}")))?;
 
         let host = parsed_url
@@ -268,8 +345,32 @@ impl S3Client {
 
         let (amz_date, date_stamp) = get_amz_dates();
         let payload_hash = sha256_hex(body);
-        let canonical_uri = sigv4_uri_encode(parsed_url.path(), false);
-        let canonical_query = parsed_url.query().unwrap_or("");
+        let decoded_path = percent_decode_to_bytes(parsed_url.path());
+        let canonical_uri = sigv4_uri_encode_bytes(&decoded_path, false);
+        let canonical_query = if let Some(q) = parsed_url.query() {
+            let mut pairs: Vec<(String, String)> = q
+                .split('&')
+                .filter(|p| !p.is_empty())
+                .map(|pair| match pair.split_once('=') {
+                    Some((k, v)) => (
+                        sigv4_uri_encode_bytes(&percent_decode_to_bytes(k), true),
+                        sigv4_uri_encode_bytes(&percent_decode_to_bytes(v), true),
+                    ),
+                    None => (
+                        sigv4_uri_encode_bytes(&percent_decode_to_bytes(pair), true),
+                        String::new(),
+                    ),
+                })
+                .collect();
+            pairs.sort();
+            pairs
+                .into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        } else {
+            String::new()
+        };
 
         let mut headers_to_sign = vec![
             ("host".to_string(), host_header),
@@ -283,6 +384,12 @@ impl S3Client {
 
         if let Some(ct) = content_type {
             headers_to_sign.push(("content-type".to_string(), ct.to_string()));
+        }
+
+        if let Some(cc) = cache_control {
+            if !cc.trim().is_empty() {
+                headers_to_sign.push(("cache-control".to_string(), cc.trim().to_string()));
+            }
         }
 
         headers_to_sign.sort_by(|a, b| a.0.cmp(&b.0));
@@ -324,7 +431,7 @@ impl S3Client {
         let mut out_headers = headers_to_sign;
         out_headers.push(("Authorization".to_string(), auth_header));
 
-        Ok((target_url, out_headers))
+        Ok((target_url.to_string(), out_headers))
     }
 }
 
@@ -342,12 +449,18 @@ impl ObjectStorage for S3Client {
             }
         }
 
+        let effective_cc = request
+            .cache_control
+            .as_deref()
+            .or(self.config.cache_control.as_deref());
+
         let (target_url, headers) = self.sign_headers(
             "PUT",
             &request.bucket,
             &request.object_key,
             &request.body,
             Some(&request.content_type),
+            effective_cc,
         )?;
 
         let mut req = self.agent.put(&target_url);
@@ -390,7 +503,8 @@ impl ObjectStorage for S3Client {
             ));
         }
 
-        let (target_url, headers) = self.sign_headers("HEAD", bucket, object_key, b"", None)?;
+        let (target_url, headers) =
+            self.sign_headers("HEAD", bucket, object_key, b"", None, None)?;
 
         let mut req = self.agent.head(&target_url);
         for (k, v) in headers {
@@ -430,7 +544,8 @@ impl ObjectStorage for S3Client {
             ));
         }
 
-        let (target_url, headers) = self.sign_headers("DELETE", bucket, object_key, b"", None)?;
+        let (target_url, headers) =
+            self.sign_headers("DELETE", bucket, object_key, b"", None, None)?;
 
         let mut req = self.agent.delete(&target_url);
         for (k, v) in headers {
@@ -447,6 +562,137 @@ impl ObjectStorage for S3Client {
             Err(ureq::Error::Transport(t)) => Err(map_transport_error(t)),
         }
     }
+
+    fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ListedObject>, StorageError> {
+        let clean_bucket = bucket.trim();
+        if clean_bucket.is_empty() {
+            return Err(StorageError::InvalidParameter(
+                "bucket cannot be empty".into(),
+            ));
+        }
+
+        let mut all_objects = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        for _page in 0..10_000 {
+            let mut query_parts = vec!["list-type=2".to_string()];
+            if let Some(p) = prefix {
+                let clean_p = p.trim_start_matches('/');
+                if !clean_p.is_empty() {
+                    query_parts.push(format!("prefix={}", sigv4_uri_encode(clean_p, true)));
+                }
+            }
+            if let Some(ref token) = continuation_token {
+                query_parts.push(format!(
+                    "continuation-token={}",
+                    sigv4_uri_encode(token, true)
+                ));
+            }
+            let suffix = format!("?{}", query_parts.join("&"));
+            let raw_url = self.build_bucket_url(clean_bucket, &suffix);
+            // build_bucket_url inserts '/' before suffix; ensure clean `/?...`
+            let target_url = raw_url.replace("/?", "?");
+
+            let (signed_url, headers) =
+                self.sign_headers_for_url("GET", &target_url, b"", None, None)?;
+
+            let mut req = self.agent.get(&signed_url);
+            for (k, v) in headers {
+                req = req.set(&k, &v);
+            }
+
+            let resp = match req.call() {
+                Ok(r) => r,
+                Err(ureq::Error::Status(code, resp)) => {
+                    let body = read_bounded_error_body(resp);
+                    return Err(map_http_status_error(code, body, clean_bucket, ""));
+                }
+                Err(ureq::Error::Transport(t)) => return Err(map_transport_error(t)),
+            };
+
+            let mut xml_bytes = Vec::new();
+            resp.into_reader()
+                .take(MAX_LIST_RESPONSE_BYTES)
+                .read_to_end(&mut xml_bytes)
+                .map_err(|e| {
+                    StorageError::Network(format!("failed to read S3 list response: {e}"))
+                })?;
+            let xml = String::from_utf8_lossy(&xml_bytes);
+
+            let (page_items, next_token) = parse_list_objects_v2_xml(&xml);
+            all_objects.extend(page_items);
+            match next_token {
+                Some(tok) if !tok.is_empty() => continuation_token = Some(tok),
+                _ => break,
+            }
+        }
+
+        all_objects.sort_by(|a, b| a.object_key.cmp(&b.object_key));
+        Ok(all_objects)
+    }
+}
+
+fn unescape_xml(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let rest = &xml[start..];
+    let end = rest.find(&close)?;
+    Some(&rest[..end])
+}
+
+fn parse_list_objects_v2_xml(xml: &str) -> (Vec<ListedObject>, Option<String>) {
+    let mut items = Vec::new();
+    let mut cursor = xml;
+    while let Some(start) = cursor.find("<Contents>") {
+        let after_start = &cursor[start + "<Contents>".len()..];
+        let Some(end) = after_start.find("</Contents>") else {
+            break;
+        };
+        let block = &after_start[..end];
+        if let Some(raw_key) = extract_xml_tag(block, "Key") {
+            let key = unescape_xml(raw_key.trim());
+            let size = extract_xml_tag(block, "Size")
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let etag = extract_xml_tag(block, "ETag")
+                .map(|s| unescape_xml(s.trim()).trim_matches('"').to_string())
+                .filter(|s| !s.is_empty());
+            if !key.is_empty() {
+                items.push(ListedObject {
+                    object_key: key,
+                    byte_size: size,
+                    etag,
+                });
+            }
+        }
+        cursor = &after_start[end + "</Contents>".len()..];
+    }
+
+    let is_truncated = extract_xml_tag(xml, "IsTruncated")
+        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let next_token = if is_truncated {
+        extract_xml_tag(xml, "NextContinuationToken")
+            .map(|s| unescape_xml(s.trim()))
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    (items, next_token)
 }
 
 #[cfg(test)]
@@ -505,6 +751,21 @@ mod tests {
             client_custom.build_url("my-bucket", "images/photo.webp"),
             "https://my-bucket.r2.example.com/images/photo.webp"
         );
+
+        let config_ip = S3StorageConfig {
+            bucket: "my-bucket".into(),
+            region: "us-east-1".into(),
+            endpoint: Some("http://127.0.0.1:9000".into()),
+            access_key_id: "key".into(),
+            secret_access_key: "secret".into(),
+            force_path_style: false,
+            ..Default::default()
+        };
+        let client_ip = S3Client::new(config_ip).unwrap();
+        assert_eq!(
+            client_ip.build_url("my-bucket", "images/photo.webp"),
+            "http://127.0.0.1:9000/my-bucket/images/photo.webp"
+        );
     }
 
     #[test]
@@ -527,6 +788,38 @@ mod tests {
         assert!(url.contains("X-Amz-Security-Token=sess%2Ftok%2B1"));
         assert!(url.contains("X-Amz-Signature="));
         assert!(!url.contains(' '));
+        assert!(!url.contains("%25"));
+        assert!(url.contains("/my-bucket/images/a%2Bb.webp?"));
+
+        let space_url = client
+            .generate_presigned_url("my-bucket", "images/my photo+1.webp", 300)
+            .unwrap();
+        assert!(space_url.contains("/my-bucket/images/my%20photo%2B1.webp?"));
+        assert!(!space_url.contains("%2520"));
+        assert!(client
+            .generate_presigned_url("my-bucket", "images/a.webp", 0)
+            .is_err());
+        assert!(client
+            .generate_presigned_url("my-bucket", "images/a.webp", 604_801)
+            .is_err());
+
+        // Verify sign_headers does not double-encode %20 -> %2520 in CanonicalURI
+        let (signed_url, headers) = client
+            .sign_headers(
+                "PUT",
+                "my-bucket",
+                "images/my photo+1.webp",
+                b"hi",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            signed_url,
+            "http://localhost:9000/my-bucket/images/my%20photo%2B1.webp"
+        );
+        let (_, auth) = headers.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert!(auth.contains("Signature="));
     }
 
     #[test]
@@ -626,5 +919,31 @@ mod tests {
         assert_eq!(head_res.etag.as_deref(), Some("abc123"));
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn test_s3_client_list_objects_xml_and_cache_control() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>my-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>images/sha1/optimized.webp</Key>
+    <Size>1234</Size>
+    <ETag>&quot;etag1&quot;</ETag>
+  </Contents>
+  <Contents>
+    <Key>images/sha2/optimized.avif</Key>
+    <Size>567</Size>
+    <ETag>"etag2"</ETag>
+  </Contents>
+</ListBucketResult>"#;
+        let (items, next) = parse_list_objects_v2_xml(xml);
+        assert!(next.is_none());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].object_key, "images/sha1/optimized.webp");
+        assert_eq!(items[0].byte_size, 1234);
+        assert_eq!(items[0].etag.as_deref(), Some("etag1"));
+        assert_eq!(items[1].object_key, "images/sha2/optimized.avif");
     }
 }

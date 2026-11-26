@@ -8,7 +8,6 @@ license.workspace = true
 hex = { workspace = true }
 hmac = { workspace = true }
 imgopt-core = { path = "../imgopt-core" }
-serde = { workspace = true }
 sha2 = { workspace = true }
 ureq = { workspace = true }
 url = { workspace = true }

@@ -4,7 +4,7 @@ use crate::analyzer::{probe_metadata_markers, ResourceLimits};
 use crate::config::MetadataPolicy;
 use crate::detect::detect_format;
 use crate::error::{ErrorKind, ImgoptError, PipelineStage, Result};
-use crate::model::{Dimensions, ImageFormat};
+use crate::model::{compute_byte_savings, Dimensions, ImageFormat};
 
 /// Requirements and invariants for validating candidate output bytes.
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +46,66 @@ pub fn validate_candidate_output(
     criteria: &ValidationCriteria,
     limits: Option<&ResourceLimits>,
 ) -> Result<ValidatedOutput> {
+    let cand_size = validate_output_header_and_metadata(candidate_bytes, criteria, limits)?;
+
+    let codec = imgopt_codecs::codec_for_format(criteria.expected_format.into());
+    let decode_limits = limits
+        .map(ResourceLimits::to_decode_limits)
+        .unwrap_or_default();
+    let decoded = codec
+        .decode_with_limits(candidate_bytes, &decode_limits)
+        .map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::OutputValidation,
+                ErrorKind::Decode(format!("corrupt candidate bytes failed to decode: {e}")),
+            )
+        })?;
+
+    if decoded.width != criteria.expected_dimensions.width
+        || decoded.height != criteria.expected_dimensions.height
+    {
+        return Err(ImgoptError::new(
+            PipelineStage::OutputValidation,
+            ErrorKind::InvalidInput(format!(
+                "candidate dimensions {}x{} do not match expected {}x{}",
+                decoded.width,
+                decoded.height,
+                criteria.expected_dimensions.width,
+                criteria.expected_dimensions.height
+            )),
+        ));
+    }
+
+    Ok(build_validated_output(
+        candidate_bytes,
+        cand_size,
+        original_size,
+        criteria,
+    ))
+}
+
+/// Fast validation path when `candidate_bytes` has already been decoded and dimension-verified
+/// with the same `ResourceLimits` during candidate evaluation or initial image analysis.
+pub(crate) fn validate_predecoded_output(
+    candidate_bytes: &[u8],
+    original_size: u64,
+    criteria: &ValidationCriteria,
+    limits: Option<&ResourceLimits>,
+) -> Result<ValidatedOutput> {
+    let cand_size = validate_output_header_and_metadata(candidate_bytes, criteria, limits)?;
+    Ok(build_validated_output(
+        candidate_bytes,
+        cand_size,
+        original_size,
+        criteria,
+    ))
+}
+
+fn validate_output_header_and_metadata(
+    candidate_bytes: &[u8],
+    criteria: &ValidationCriteria,
+    limits: Option<&ResourceLimits>,
+) -> Result<u64> {
     if candidate_bytes.is_empty() {
         return Err(ImgoptError::new(
             PipelineStage::OutputValidation,
@@ -124,46 +184,18 @@ pub fn validate_candidate_output(
         ));
     }
 
-    let codec = imgopt_codecs::codec_for_format(criteria.expected_format.into());
-    let decode_limits = limits
-        .map(ResourceLimits::to_decode_limits)
-        .unwrap_or_default();
-    let decoded = codec
-        .decode_with_limits(candidate_bytes, &decode_limits)
-        .map_err(|e| {
-            ImgoptError::new(
-                PipelineStage::OutputValidation,
-                ErrorKind::Decode(format!("corrupt candidate bytes failed to decode: {e}")),
-            )
-        })?;
+    Ok(cand_size)
+}
 
-    if decoded.width != criteria.expected_dimensions.width
-        || decoded.height != criteria.expected_dimensions.height
-    {
-        return Err(ImgoptError::new(
-            PipelineStage::OutputValidation,
-            ErrorKind::InvalidInput(format!(
-                "candidate dimensions {}x{} do not match expected {}x{}",
-                decoded.width,
-                decoded.height,
-                criteria.expected_dimensions.width,
-                criteria.expected_dimensions.height
-            )),
-        ));
-    }
+fn build_validated_output(
+    candidate_bytes: &[u8],
+    cand_size: u64,
+    original_size: u64,
+    criteria: &ValidationCriteria,
+) -> ValidatedOutput {
+    let (savings_bytes, savings_ratio) = compute_byte_savings(original_size, cand_size);
 
-    let savings_bytes = if original_size >= cand_size {
-        i64::try_from(original_size - cand_size).unwrap_or(i64::MAX)
-    } else {
-        -i64::try_from(cand_size - original_size).unwrap_or(i64::MAX)
-    };
-    let savings_ratio = if original_size > 0 {
-        savings_bytes as f64 / original_size as f64
-    } else {
-        0.0
-    };
-
-    Ok(ValidatedOutput {
+    ValidatedOutput {
         format: criteria.expected_format,
         bytes: candidate_bytes.to_vec(),
         byte_size: cand_size,
@@ -171,7 +203,7 @@ pub fn validate_candidate_output(
         dimensions: criteria.expected_dimensions,
         savings_bytes,
         savings_ratio,
-    })
+    }
 }
 
 #[cfg(test)]

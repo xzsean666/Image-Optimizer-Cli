@@ -14,6 +14,7 @@
    - [4.3 `imgopt inspect`（图片元数据与特征探查）](#43-imgopt-inspect图片元数据与特征探查)
    - [4.4 `imgopt verify`（清单与存储校验）](#44-imgopt-verify清单与存储校验)
    - [4.5 `imgopt benchmark`（基准性能测试）](#45-imgopt-benchmark基准性能测试)
+   - [4.6 `imgopt gc`（云端孤儿对象清理）](#46-imgopt-gc云端孤儿对象清理)
 5. [预设模式与画质控制（Presets）](#5-预设模式与画质控制presets)
 6. [云存储配置与环境变量](#6-云存储配置与环境变量)
 7. [常见问题与最佳实践 (FAQ)](#7-常见问题与最佳实践-faq)
@@ -62,13 +63,16 @@ cargo build --release
 
 ## 2. 核心功能与设计亮点
 
-* **三格式深度优化**：
-  - **JPEG**：采用最优 Huffman 统计表、渐进式扫描（Progressive Scans）与自适应 4:2:0 色度抽样，减小 20%~35% 体积。
-  - **PNG**：集成 **OxiPNG** 引擎，支持多 Filter 策略穷举与 Deflate 深度压缩，完全无损削减 40%+。
-  - **WebP**：支持 Lossy 与 Lossless 智能自适应决策，高压缩率同时保留极高感官细节。
+* **五格式深度优化与动图支持**：
+  - **JPEG**：采用最优 Huffman 统计表、渐进式扫描（Progressive Scans）与自适应 4:4:4 / 4:2:0 色度抽样，减小 20%~35% 体积。
+  - **PNG**：集成 **OxiPNG** 无损引擎与 **ExoQuant** 有损调色板量化（PNG8），大幅削减体积。
+  - **WebP**：支持 Lossy 与 Lossless 自适应决策及透明通道，高压缩率同时保留极高感官细节。
+  - **AVIF**：内置纯 Rust AVIF 编解码（`ravif` + `rav1d`），通常比 WebP 再缩减 20%~30% 体积。
+  - **GIF 与动图**：支持静态/动态 GIF、动态 WebP、APNG 帧序列缩放与转换。
+* **Lanczos3 高画质缩放与 ICC 广色域管理**：支持 `scale-down` / `contain` / `cover` / `exact` 缩放；剥离 ICC 时自动转换 Display P3 / AdobeRGB 为 sRGB 防止偏色。
 * **高精度二分率失真寻优**：基于单调 SSIM 感知质量模型，以 1 的质量精度（1..100）精准锁定满足画质要求的最低文件体积。
-* **SHA-256 内容寻址去重**：基于文件内容流式哈希生成唯一指纹，文件名与路径变动不会重复压缩或重复上传。
-* **S3/R2 增量同步与断点续传**：带指数退避重试，上传前后校验哈希，原子写入 Manifest 清单，故障自动隔离。
+* **SHA-256 内容寻址去重**：基于文件内容流式哈希生成唯一指纹，支持 `sync` 云端同步及 `optimize --manifest` 本地增量跳过。
+* **S3/R2 增量同步、强缓存与垃圾回收**：带指数退避重试，默认附带不可变 `Cache-Control`，支持并发 `verify` 校验与 `gc` 清理云端孤儿对象。
 
 ---
 
@@ -121,9 +125,21 @@ imgopt optimize <INPUT> [OPTIONS]
 | `--preset <PRESET>` | — | `balanced` | 优化预设：`balanced`, `maximum`, `aggressive` |
 | `--quality <F64>` | `-q` | 预设默认 | 显式指定目标 SSIM 画质分数（`0.0` 至 `1.0`，例如 `0.95`） |
 | `--effort <U8>` | `-e` | 预设默认 | 编码耗力级别（`1` 至 `6`，数值越大压缩率越高、耗时越长） |
-| `--format <POLICY>` | — | `preserve` | 格式策略：`preserve`（保持原格式）、`webp`（优先转 WebP）、`jpeg`、`png` |
-| `--preserve-metadata`| — | `false` | 是否保留 EXIF / ICC / XMP 元数据（默认剔除以最大化瘦身） |
-| `--concurrency <N>` | — | CPU 核数 | 最大并发处理线程数 |
+| `--format <POLICY>` | — | `preserve` | 格式策略：`preserve`、`webp`、`avif`、`auto`、`jpeg`、`png`、`gif`、`force-webp`、`force-avif` |
+| `--resize-width <PX>` | — | 无 | 目标缩放宽度（像素） |
+| `--resize-height <PX>` | — | 无 | 目标缩放高度（像素） |
+| `--resize-mode <MODE>` | — | `scale-down` | 缩放模式：`scale-down`、`contain`、`cover`、`exact` |
+| `--preserve-metadata`| — | `false` | 是否保留 EXIF / ICC / XMP 元数据（默认剔除并自动转换 ICC 到 sRGB） |
+| `--preserve-icc` | — | `false` | 仅保留 ICC 色彩配置，剥离 EXIF / XMP 隐私数据 |
+| `--no-srgb-convert` | — | `false` | 禁用剥离 ICC 时的自动 sRGB 色彩转换 |
+| `--manifest <PATH>` | — | 无 | 本地增量缓存清单路径（内容与配置一致时跳过重复压缩） |
+| `--json <PATH>` | — | 无 | 导出机器可读的运行结果 JSON |
+| `--include <GLOB>` | — | 无 | 仅处理匹配的相对路径（可重复指定） |
+| `--exclude <GLOB>` | — | 无 | 排除匹配的相对路径（可重复指定） |
+| `--quiet` | `-Q` | `false` | 静默逐文件输出，仅打印汇总 |
+| `--concurrency <N>` | — | CPU 核数（上限 `16`） | 最大并发处理线程数 |
+| `--max-width <PX>` | — | `16384` | 允许的最大输入图像宽度（像素） |
+| `--max-height <PX>` | — | `16384` | 允许的最大输入图像高度（像素） |
 
 ---
 
@@ -145,9 +161,12 @@ imgopt sync <INPUT> [OPTIONS]
 | `--endpoint <URL>` | 环境变量 | 覆盖 S3 / R2 API 端点地址 |
 | `--prefix <PREFIX>` | 无 | 远程对象存储 Key 前缀（如 `assets/`） |
 | `--public-url-base <URL>`| 环境变量 | 自定义 CDN 域名（如 `https://cdn.mysite.com`） |
+| `--cache-control <STR>` | `public, max-age=31536000, immutable` | 自定义上传对象的 `Cache-Control` 响应头 |
+| `--force-path-style <BOOL>` | `true` | 是否强制使用 Path-Style S3 URL |
 | `--concurrency <N>` | `4` | 最大并发处理与上传线程数 |
 | `--preset <PRESET>` | `balanced` | 优化预设（`balanced` / `maximum` / `aggressive`） |
-| `--format <POLICY>` | `webp` | 输出格式策略（默认优先转为现代 `webp`） |
+| `--format <POLICY>` | `webp` | 输出格式策略（支持 `auto`、`avif`、`webp`、`preserve` 等） |
+| `--fail-on-error` | `false` | 若存在任意文件同步失败则返回非零退出码（适合 CI/CD） |
 
 ---
 
@@ -184,8 +203,8 @@ Image: sample.jpg
 # 仅校验本地 Manifest 语法与记录条目
 imgopt verify --manifest manifest.json
 
-# 深度校验：同时向远程 S3 发送 HEAD 请求验证对象是否存在且 ETag 匹配
-imgopt verify --manifest manifest.json --check-storage
+# 深度校验：并发向远程 S3 发送 HEAD 请求验证对象是否存在且 ETag 匹配
+imgopt verify --manifest manifest.json --check-storage --concurrency 16
 ```
 
 ---
@@ -194,7 +213,20 @@ imgopt verify --manifest manifest.json --check-storage
 在指定图片数据集上运行基准测试，统计吞吐量、平均压缩率、SSIM 画质与耗时分布。
 
 ```bash
-imgopt benchmark ./test_dataset --preset balanced --json benchmark_report.json
+imgopt benchmark ./test_dataset --preset balanced --format auto --json benchmark_report.json
+```
+
+---
+
+### 4.6 `imgopt gc`（云端孤儿对象清理）
+列举远程存储中未被当前 Manifest 引用的过期对象，默认处于安全 Dry-Run 模式，传入 `--delete` 时才执行删除：
+
+```bash
+# 预览孤儿对象（不删除）
+imgopt gc --manifest manifest.json --prefix assets
+
+# 确认并删除孤儿对象，同时导出 JSON 报告
+imgopt gc --manifest manifest.json --prefix assets --delete --json gc_report.json
 ```
 
 ---

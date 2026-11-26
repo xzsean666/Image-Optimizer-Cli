@@ -140,7 +140,9 @@ fn test_verify_check_storage_detects_missing_404_and_passes_200() {
                     .unwrap();
             } else {
                 stream
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
                     .unwrap();
             }
         }

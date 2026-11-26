@@ -17,8 +17,7 @@ This document records the architectural and technical design decisions made duri
 ## ADR-002: Deterministic Optimization Key
 
 - **Context**: Changes to optimization settings (e.g. preset, target format, quality target, effort, metadata policy, or optimizer version) require re-evaluating whether an existing optimized asset satisfies the new criteria.
-- **Decision**: Derive a canonical `optimization_key` formatted as:
-  `{source_sha256}:{optimizer_version}:{target_format}:{preset}:{quality_target}:{effort}:{metadata_policy}`.
+- **Decision**: Compute a canonical string from `scheme_version`, `source_sha256`, `optimizer_version`, `output_format`, and normalized `OptimizationConfig` (`preset`, `quality_target`, `effort`, `metadata_policy`, `output_format_policy`, `max_width`, `max_height`), then hash it into `opt-v1-{output_format}-{preset}-{sha256}`.
 - **Consequences**:
   - Guaranteed idempotence: identical input + identical config produces the same key.
   - Changing any optimization parameter triggers reprocessing, preventing stale low-quality artifacts.

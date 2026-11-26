@@ -8,7 +8,8 @@ pub mod url;
 pub use adapter::StorageSyncAdapter;
 pub use config::S3StorageConfig;
 pub use interface::{
-    MemoryObjectStorage, ObjectMetadata, ObjectStorage, StorageError, UploadRequest, UploadResponse,
+    ListedObject, MemoryObjectStorage, ObjectMetadata, ObjectStorage, StorageError, UploadRequest,
+    UploadResponse,
 };
 pub use s3::S3Client;
 pub use upload::{upload_and_verify, RetryPolicy, VerifiedUploadResult};

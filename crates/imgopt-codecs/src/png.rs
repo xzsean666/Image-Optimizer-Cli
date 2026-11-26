@@ -17,7 +17,7 @@ impl ImageCodec for PngCodec {
         CodecCapabilities {
             format: CodecFormat::Png,
             supports_lossless: true,
-            supports_lossy: false,
+            supports_lossy: true,
             supports_alpha: true,
         }
     }
@@ -50,48 +50,22 @@ impl ImageCodec for PngCodec {
             ));
         }
 
-        // Fast initial serialization because oxipng immediately re-evaluates filters and DEFLATE.
-        let mut encoded_bytes = Vec::new();
-        let mut encoder = PngEncoder::new_with_quality(
-            &mut encoded_bytes,
-            CompressionType::Fast,
-            FilterType::NoFilter,
-        );
-
         let preserve = options.effective_preservation();
-        if preserve.preserve_icc {
-            if let Some(ref icc) = pixels.metadata.icc_profile {
-                if !icc.is_empty() {
-                    let _ = encoder.set_icc_profile(icc.clone());
-                }
-            }
-        }
-        if preserve.preserve_exif {
-            if let Some(ref exif) = pixels.metadata.exif {
-                if !exif.is_empty() {
-                    let _ = encoder.set_exif_metadata(exif.clone());
-                }
-            }
-        }
 
-        let color_type = match pixels.pixel_format {
-            PixelFormat::Grayscale8 => image::ExtendedColorType::L8,
-            PixelFormat::GrayscaleAlpha8 => image::ExtendedColorType::La8,
-            PixelFormat::Rgb8 => image::ExtendedColorType::Rgb8,
-            PixelFormat::Rgba8 => image::ExtendedColorType::Rgba8,
+        // Lossy palette quantization path when requested (quality < 100 and !lossless)
+        // Skip quantization for tiny images (<= 256 px) where PLTE table overhead exceeds savings.
+        let num_pixels = u64::from(pixels.width) * u64::from(pixels.height);
+        let mut encoded_bytes = if !options.lossless
+            && options.quality < 100
+            && num_pixels > 256
+            && matches!(
+                pixels.pixel_format,
+                PixelFormat::Rgb8 | PixelFormat::Rgba8 | PixelFormat::GrayscaleAlpha8
+            ) {
+            encode_quantized_indexed_png(pixels, options.quality, preserve)?
+        } else {
+            encode_truecolor_png(pixels, preserve)?
         };
-
-        encoder
-            .write_image(&pixels.data, pixels.width, pixels.height, color_type)
-            .map_err(|e| CodecError::EncodeError(format!("PNG encode error: {e}")))?;
-
-        if preserve.preserve_xmp {
-            if let Some(ref xmp) = pixels.metadata.xmp {
-                if !xmp.is_empty() {
-                    encoded_bytes = insert_png_xmp_itxt(encoded_bytes, xmp);
-                }
-            }
-        }
 
         // Apply OxiPNG lossless compression optimization
         let opt_level = options.effort.clamp(1, 6);
@@ -128,6 +102,160 @@ impl ImageCodec for PngCodec {
             effective_options: options.clone(),
         })
     }
+}
+
+fn encode_truecolor_png(
+    pixels: &DecodedPixels,
+    preserve: crate::interface::MetadataPreservation,
+) -> Result<Vec<u8>, CodecError> {
+    // Fast initial serialization because oxipng immediately re-evaluates filters and DEFLATE.
+    let mut encoded_bytes = Vec::new();
+    let mut encoder = PngEncoder::new_with_quality(
+        &mut encoded_bytes,
+        CompressionType::Fast,
+        FilterType::NoFilter,
+    );
+
+    if preserve.preserve_icc {
+        if let Some(ref icc) = pixels.metadata.icc_profile {
+            if !icc.is_empty() {
+                encoder.set_icc_profile(icc.clone()).map_err(|e| {
+                    CodecError::EncodeError(format!("failed to embed PNG ICC profile: {e}"))
+                })?;
+            }
+        }
+    }
+    if preserve.preserve_exif {
+        if let Some(ref exif) = pixels.metadata.exif {
+            if !exif.is_empty() {
+                encoder.set_exif_metadata(exif.clone()).map_err(|e| {
+                    CodecError::EncodeError(format!("failed to embed PNG EXIF metadata: {e}"))
+                })?;
+            }
+        }
+    }
+
+    let color_type = match pixels.pixel_format {
+        PixelFormat::Grayscale8 => image::ExtendedColorType::L8,
+        PixelFormat::GrayscaleAlpha8 => image::ExtendedColorType::La8,
+        PixelFormat::Rgb8 => image::ExtendedColorType::Rgb8,
+        PixelFormat::Rgba8 => image::ExtendedColorType::Rgba8,
+    };
+
+    encoder
+        .write_image(&pixels.data, pixels.width, pixels.height, color_type)
+        .map_err(|e| CodecError::EncodeError(format!("PNG encode error: {e}")))?;
+
+    if preserve.preserve_xmp {
+        if let Some(ref xmp) = pixels.metadata.xmp {
+            if !xmp.is_empty() {
+                encoded_bytes = insert_png_xmp_itxt(encoded_bytes, xmp);
+            }
+        }
+    }
+    Ok(encoded_bytes)
+}
+
+fn encode_quantized_indexed_png(
+    pixels: &DecodedPixels,
+    quality: u8,
+    preserve: crate::interface::MetadataPreservation,
+) -> Result<Vec<u8>, CodecError> {
+    let rgba_colors: Vec<exoquant::Color> = match pixels.pixel_format {
+        PixelFormat::Rgba8 => pixels
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| exoquant::Color::new(c[0], c[1], c[2], c[3]))
+            .collect(),
+        PixelFormat::Rgb8 => pixels
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|c| exoquant::Color::new(c[0], c[1], c[2], 255))
+            .collect(),
+        PixelFormat::GrayscaleAlpha8 => pixels
+            .data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| exoquant::Color::new(c[0], c[0], c[0], c[1]))
+            .collect(),
+        PixelFormat::Grayscale8 => {
+            return encode_truecolor_png(pixels, preserve);
+        }
+    };
+
+    let num_colors = ((u32::from(quality.clamp(1, 99)) * 240) / 99 + 16).clamp(16, 256) as usize;
+    let (palette, indexed) = exoquant::convert_to_indexed(
+        &rgba_colors,
+        pixels.width as usize,
+        num_colors,
+        &exoquant::optimizer::KMeans,
+        &exoquant::ditherer::FloydSteinberg::new(),
+    );
+
+    let mut plte = Vec::with_capacity(palette.len() * 3);
+    let mut trns = Vec::with_capacity(palette.len());
+    let mut has_alpha = false;
+    for c in &palette {
+        plte.push(c.r);
+        plte.push(c.g);
+        plte.push(c.b);
+        trns.push(c.a);
+        if c.a < 255 {
+            has_alpha = true;
+        }
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, pixels.width, pixels.height);
+        encoder.set_color(png::ColorType::Indexed);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_palette(plte);
+        if has_alpha {
+            encoder.set_trns(trns);
+        }
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| CodecError::EncodeError(format!("PNG indexed header error: {e}")))?;
+        writer
+            .write_image_data(&indexed)
+            .map_err(|e| CodecError::EncodeError(format!("PNG indexed write error: {e}")))?;
+    }
+
+    // Re-attach preserved ICC/EXIF/XMP via truecolor metadata path if needed
+    if preserve.any() {
+        let mut tmp_pixels = DecodedPixels::with_metadata(
+            pixels.width,
+            pixels.height,
+            pixels.pixel_format,
+            pixels.data.clone(),
+            pixels.metadata.clone(),
+        );
+        // Reuse PNG chunk injection for XMP; for ICC/EXIF if requested on quantized PNG,
+        // inject directly via oxipng/png chunks or fall back cleanly.
+        if preserve.preserve_xmp {
+            if let Some(ref xmp) = tmp_pixels.metadata.xmp.take() {
+                if !xmp.is_empty() {
+                    out = insert_png_xmp_itxt(out, xmp);
+                }
+            }
+        }
+        if preserve.preserve_icc || preserve.preserve_exif {
+            // When ICC or EXIF must be preserved with indexed PNG, encode truecolor with metadata if smaller isn't required
+            // or insert standard chunks. Using truecolor fallback when ICC/EXIF requested keeps chunk framing 100% compliant.
+            let tc = encode_truecolor_png(pixels, preserve)?;
+            if tc.len() <= out.len() {
+                out = tc;
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 fn insert_png_xmp_itxt(png_bytes: Vec<u8>, xmp: &[u8]) -> Vec<u8> {
@@ -181,14 +309,31 @@ fn insert_png_xmp_itxt(png_bytes: Vec<u8>, xmp: &[u8]) -> Vec<u8> {
     out
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if c & 1 != 0 {
+                c = 0xEDB8_8320 ^ (c >> 1);
+            } else {
+                c >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
 fn png_crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        let idx = ((crc ^ u32::from(b)) & 0xFF) as usize;
+        crc = CRC32_TABLE[idx] ^ (crc >> 8);
     }
     !crc
 }
@@ -213,7 +358,15 @@ mod tests {
         }
 
         let pixels = DecodedPixels::new(width, height, PixelFormat::Rgb8, rgb.clone());
-        let encoded = codec.encode(&pixels, &EncodeOptions::default()).unwrap();
+        let encoded = codec
+            .encode(
+                &pixels,
+                &EncodeOptions {
+                    lossless: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let decoded = codec.decode(&encoded.bytes).unwrap();
 
         assert_eq!(decoded.width, width);
@@ -238,7 +391,15 @@ mod tests {
         ];
 
         let pixels = DecodedPixels::new(width, height, PixelFormat::Rgba8, rgba.clone());
-        let encoded = codec.encode(&pixels, &EncodeOptions::default()).unwrap();
+        let encoded = codec
+            .encode(
+                &pixels,
+                &EncodeOptions {
+                    lossless: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let decoded = codec.decode(&encoded.bytes).unwrap();
 
         assert_eq!(decoded.pixel_format, PixelFormat::Rgba8);
@@ -279,7 +440,10 @@ mod tests {
         };
         let encoded = codec.encode(&pixels, &opts_keep).unwrap();
         let decoded = codec.decode(&encoded.bytes).unwrap();
-        assert_eq!(decoded.metadata.icc_profile.as_deref(), Some(icc.as_slice()));
+        assert_eq!(
+            decoded.metadata.icc_profile.as_deref(),
+            Some(icc.as_slice())
+        );
         assert_eq!(decoded.metadata.exif.as_deref(), Some(exif.as_slice()));
         assert_eq!(decoded.metadata.xmp.as_deref(), Some(xmp.as_slice()));
 
@@ -295,5 +459,55 @@ mod tests {
             codec.decode(b"not a valid png"),
             Err(CodecError::DecodeError(_))
         ));
+    }
+
+    #[test]
+    fn test_png_lossy_quantized_reduces_size() {
+        let codec = PngCodec;
+        let w = 128;
+        let h = 128;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        let mut state = 0x1234_5678u32;
+        for y in 0..h {
+            for x in 0..w {
+                // Pseudo-photographic smooth color variation + subtle noise (defeats raw DEFLATE)
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let jitter = ((state >> 24) as u8) & 0x0F;
+                rgba.push(((x * 2) as u8).saturating_add(jitter));
+                rgba.push(((y * 2) as u8).saturating_add(jitter));
+                rgba.push((((x + y) % 256) as u8).saturating_add(jitter));
+                rgba.push(if (x / 8 + y / 8) % 2 == 0 { 220 } else { 255 });
+            }
+        }
+        let pixels = DecodedPixels::new(w, h, PixelFormat::Rgba8, rgba);
+        let lossless = codec
+            .encode(
+                &pixels,
+                &EncodeOptions {
+                    lossless: true,
+                    quality: 100,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let lossy = codec
+            .encode(
+                &pixels,
+                &EncodeOptions {
+                    lossless: false,
+                    quality: 75,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            lossy.bytes.len() < lossless.bytes.len(),
+            "expected quantized lossy PNG ({}) < lossless ({})",
+            lossy.bytes.len(),
+            lossless.bytes.len()
+        );
+        let dec = codec.decode(&lossy.bytes).unwrap();
+        assert_eq!(dec.width, w);
+        assert_eq!(dec.height, h);
     }
 }

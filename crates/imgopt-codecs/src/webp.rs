@@ -84,7 +84,7 @@ impl ImageCodec for WebpCodec {
             }
             PixelFormat::GrayscaleAlpha8 => {
                 let mut rgba_data = Vec::with_capacity(pixels.data.len() * 2);
-                for chunk in pixels.data.chunks_exact(2) {
+                for chunk in pixels.data.as_chunks::<2>().0 {
                     let l = chunk[0];
                     let a = chunk[1];
                     rgba_data.push(l);
@@ -115,7 +115,7 @@ impl ImageCodec for WebpCodec {
                 pixels.pixel_format.has_alpha(),
                 &pixels.metadata,
                 preserve,
-            );
+            )?;
         }
 
         Ok(EncodedOutput {
@@ -136,9 +136,11 @@ fn mux_webp_metadata(
     has_alpha: bool,
     metadata: &ImageMetadataChunks,
     preserve: MetadataPreservation,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, CodecError> {
     if webp_bytes.len() < 20 || &webp_bytes[0..4] != b"RIFF" || &webp_bytes[8..12] != b"WEBP" {
-        return webp_bytes.to_vec();
+        return Err(CodecError::EncodeError(
+            "invalid WebP RIFF container returned by encoder".into(),
+        ));
     }
 
     let icc = preserve
@@ -158,21 +160,64 @@ fn mux_webp_metadata(
         .filter(|b| !b.is_empty());
 
     if icc.is_none() && exif.is_none() && xmp.is_none() {
-        return webp_bytes.to_vec();
+        return Ok(webp_bytes.to_vec());
     }
 
     let Some((w_m1, h_m1)) = width.checked_sub(1).zip(height.checked_sub(1)) else {
-        return webp_bytes.to_vec();
+        return Err(CodecError::InvalidParameter(
+            "WebP dimensions cannot be zero".into(),
+        ));
     };
     if w_m1 > 0x00FF_FFFF || h_m1 > 0x00FF_FFFF {
-        return webp_bytes.to_vec();
+        return Err(CodecError::InvalidParameter(
+            "WebP dimensions exceed 24-bit VP8X limit".into(),
+        ));
+    }
+
+    // Inspect existing image chunks before emitting VP8X flags so the alpha bit accurately
+    // reflects whether the encoded bitstream actually carries ALPH / VP8L alpha data.
+    let mut chunk_slices: Vec<([u8; 4], &[u8])> = Vec::new();
+    let mut saw_alph_or_vp8l = false;
+    let mut saw_vp8x_alpha = false;
+    let mut pos = 12usize;
+    while pos + 8 <= webp_bytes.len() {
+        let fourcc = &webp_bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            webp_bytes[pos + 4],
+            webp_bytes[pos + 5],
+            webp_bytes[pos + 6],
+            webp_bytes[pos + 7],
+        ]) as usize;
+        let data_start = pos + 8;
+        let data_end = data_start
+            .checked_add(size)
+            .filter(|&end| end <= webp_bytes.len())
+            .ok_or_else(|| {
+                CodecError::EncodeError("corrupt WebP RIFF chunk length during muxing".into())
+            })?;
+
+        if fourcc == b"VP8X" && size >= 1 {
+            saw_vp8x_alpha = (webp_bytes[data_start] & (1 << 4)) != 0;
+        }
+        if fourcc == b"ALPH" || fourcc == b"VP8L" {
+            saw_alph_or_vp8l = true;
+        }
+        if fourcc != b"VP8X" && fourcc != b"ICCP" && fourcc != b"EXIF" && fourcc != b"XMP " {
+            let fourcc_arr: [u8; 4] = fourcc
+                .try_into()
+                .map_err(|_| CodecError::EncodeError("invalid WebP FourCC chunk header".into()))?;
+            chunk_slices.push((fourcc_arr, &webp_bytes[data_start..data_end]));
+        }
+
+        let padded = size + (size & 1);
+        pos = data_start.saturating_add(padded);
     }
 
     let mut flags: u8 = 0;
     if icc.is_some() {
         flags |= 1 << 5; // ICC profile
     }
-    if has_alpha {
+    if has_alpha && (saw_alph_or_vp8l || saw_vp8x_alpha) {
         flags |= 1 << 4; // Alpha
     }
     if exif.is_some() {
@@ -195,65 +240,41 @@ fn mux_webp_metadata(
 
     // ICCP must precede image bitstream chunks per WebP spec
     if let Some(data) = icc {
-        append_riff_chunk(&mut body, b"ICCP", data);
+        append_riff_chunk(&mut body, b"ICCP", data)?;
     }
 
-    // Copy original image chunks (skipping any pre-existing VP8X/ICCP/EXIF/XMP)
-    let mut pos = 12usize;
-    while pos + 8 <= webp_bytes.len() {
-        let fourcc = &webp_bytes[pos..pos + 4];
-        let size = u32::from_le_bytes([
-            webp_bytes[pos + 4],
-            webp_bytes[pos + 5],
-            webp_bytes[pos + 6],
-            webp_bytes[pos + 7],
-        ]) as usize;
-        let data_start = pos + 8;
-        let Some(data_end) = data_start.checked_add(size) else {
-            return webp_bytes.to_vec();
-        };
-        if data_end > webp_bytes.len() {
-            return webp_bytes.to_vec();
-        }
-
-        if fourcc != b"VP8X" && fourcc != b"ICCP" && fourcc != b"EXIF" && fourcc != b"XMP " {
-            let Ok(fourcc_arr): Result<[u8; 4], _> = fourcc.try_into() else {
-                return webp_bytes.to_vec();
-            };
-            append_riff_chunk(&mut body, &fourcc_arr, &webp_bytes[data_start..data_end]);
-        }
-
-        let padded = size + (size & 1);
-        pos = data_start.saturating_add(padded);
+    for (fourcc_arr, slice) in chunk_slices {
+        append_riff_chunk(&mut body, &fourcc_arr, slice)?;
     }
 
     if let Some(data) = exif {
-        append_riff_chunk(&mut body, b"EXIF", data);
+        append_riff_chunk(&mut body, b"EXIF", data)?;
     }
     if let Some(data) = xmp {
-        append_riff_chunk(&mut body, b"XMP ", data);
+        append_riff_chunk(&mut body, b"XMP ", data)?;
     }
 
-    let Ok(riff_len) = u32::try_from(body.len()) else {
-        return webp_bytes.to_vec();
-    };
+    let riff_len = u32::try_from(body.len()).map_err(|_| {
+        CodecError::EncodeError("WebP output exceeds 4GB RIFF container limit".into())
+    })?;
     let mut out = Vec::with_capacity(8 + body.len());
     out.extend_from_slice(b"RIFF");
     out.extend_from_slice(&riff_len.to_le_bytes());
     out.extend_from_slice(&body);
-    out
+    Ok(out)
 }
 
-fn append_riff_chunk(buf: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) {
-    let Ok(len) = u32::try_from(data.len()) else {
-        return;
-    };
+fn append_riff_chunk(buf: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) -> Result<(), CodecError> {
+    let len = u32::try_from(data.len()).map_err(|_| {
+        CodecError::EncodeError("WebP metadata chunk exceeds 4GB RIFF chunk limit".into())
+    })?;
     buf.extend_from_slice(fourcc);
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(data);
     if data.len() % 2 == 1 {
         buf.push(0);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -350,13 +371,52 @@ mod tests {
         };
         let encoded = codec.encode(&pixels, &opts_keep).unwrap();
         let decoded = codec.decode(&encoded.bytes).unwrap();
-        assert_eq!(decoded.metadata.icc_profile.as_deref(), Some(icc.as_slice()));
+        assert_eq!(
+            decoded.metadata.icc_profile.as_deref(),
+            Some(icc.as_slice())
+        );
         assert_eq!(decoded.metadata.exif.as_deref(), Some(exif.as_slice()));
         assert_eq!(decoded.metadata.xmp.as_deref(), Some(xmp.as_slice()));
 
         let encoded_strip = codec.encode(&pixels, &EncodeOptions::default()).unwrap();
         let decoded_strip = codec.decode(&encoded_strip.bytes).unwrap();
         assert!(decoded_strip.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_webp_opaque_rgba_with_metadata_roundtrips() {
+        let codec = WebpCodec;
+        let pixels = DecodedPixels::with_metadata(
+            4,
+            4,
+            PixelFormat::Rgba8,
+            [100, 150, 200, 255].repeat(16),
+            ImageMetadataChunks {
+                icc_profile: Some(b"icc-opaque".to_vec()),
+                exif: None,
+                xmp: Some(b"<x:xmpmeta/>".to_vec()),
+            },
+        );
+        let encoded = codec
+            .encode(
+                &pixels,
+                &EncodeOptions {
+                    preserve_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let decoded = codec.decode(&encoded.bytes).unwrap();
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 4);
+        assert_eq!(
+            decoded.metadata.icc_profile.as_deref(),
+            Some(b"icc-opaque".as_slice())
+        );
+        assert_eq!(
+            decoded.metadata.xmp.as_deref(),
+            Some(b"<x:xmpmeta/>".as_slice())
+        );
     }
 
     #[test]

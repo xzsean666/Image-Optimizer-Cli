@@ -3,7 +3,34 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::model::{Manifest, CURRENT_SCHEMA_VERSION};
-use imgopt_core::{ErrorKind, ImgoptError, PipelineStage, Result};
+use imgopt_core::{read_file_bounded, ErrorKind, ImgoptError, PipelineStage, Result};
+
+const MAX_MANIFEST_BYTES: u64 = 128 * 1024 * 1024; // 128 MB safety cap
+
+/// Atomically persist raw bytes to `dest` via an exclusive temporary file, `sync_all`, and rename.
+pub(crate) fn write_bytes_atomically(
+    dest: &Path,
+    bytes: &[u8],
+    tmp_prefix: &str,
+    tmp_suffix: &str,
+) -> std::io::Result<()> {
+    let parent_dir = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if !parent_dir.exists() {
+        fs::create_dir_all(parent_dir)?;
+    }
+
+    let mut tmp_file = tempfile::Builder::new()
+        .prefix(tmp_prefix)
+        .suffix(tmp_suffix)
+        .tempfile_in(parent_dir)?;
+    tmp_file.write_all(bytes)?;
+    tmp_file.as_file().sync_all()?;
+    tmp_file.persist(dest).map_err(|e| e.error)?;
+    Ok(())
+}
 
 /// Advisory exclusive OS file lock guarding concurrent multi-process manifest updates.
 /// Automatically released by the OS kernel when dropped or if the process terminates.
@@ -121,15 +148,12 @@ impl ManifestStore {
             .with_path(&self.path));
         }
 
-        let content = fs::read_to_string(&self.path).map_err(|e| {
-            ImgoptError::new(
-                PipelineStage::ManifestLookup,
-                ErrorKind::Io(format!("failed to read manifest file: {e}")),
-            )
-            .with_path(&self.path)
-        })?;
-
-        let manifest: Manifest = serde_json::from_str(&content).map_err(|e| {
+        let bytes = read_file_bounded(
+            &self.path,
+            MAX_MANIFEST_BYTES,
+            PipelineStage::ManifestLookup,
+        )?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
             ImgoptError::new(
                 PipelineStage::ManifestLookup,
                 ErrorKind::Persistence(format!("malformed manifest JSON: {e}")),
@@ -164,22 +188,6 @@ impl ManifestStore {
             .with_path(&self.path));
         }
 
-        let parent_dir = match self.path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        if !parent_dir.exists() {
-            fs::create_dir_all(parent_dir).map_err(|e| {
-                ImgoptError::new(
-                    PipelineStage::ManifestCommit,
-                    ErrorKind::Io(format!(
-                        "failed to create parent directory for manifest: {e}"
-                    )),
-                )
-                .with_path(parent_dir)
-            })?;
-        }
-
         let json_bytes = serde_json::to_vec_pretty(manifest).map_err(|e| {
             ImgoptError::new(
                 PipelineStage::ManifestCommit,
@@ -188,41 +196,10 @@ impl ManifestStore {
             .with_path(&self.path)
         })?;
 
-        let mut tmp_file = tempfile::Builder::new()
-            .prefix(".manifest-")
-            .suffix(".tmp")
-            .tempfile_in(parent_dir)
-            .map_err(|e| {
-                ImgoptError::new(
-                    PipelineStage::ManifestCommit,
-                    ErrorKind::Io(format!("failed to create temporary manifest file: {e}")),
-                )
-                .with_path(parent_dir)
-            })?;
-
-        tmp_file.write_all(&json_bytes).map_err(|e| {
+        write_bytes_atomically(&self.path, &json_bytes, ".manifest-", ".tmp").map_err(|e| {
             ImgoptError::new(
                 PipelineStage::ManifestCommit,
-                ErrorKind::Io(format!("failed to write temporary manifest file: {e}")),
-            )
-            .with_path(tmp_file.path())
-        })?;
-
-        tmp_file.as_file().sync_all().map_err(|e| {
-            ImgoptError::new(
-                PipelineStage::ManifestCommit,
-                ErrorKind::Io(format!("failed to sync temporary manifest file: {e}")),
-            )
-            .with_path(tmp_file.path())
-        })?;
-
-        tmp_file.persist(&self.path).map_err(|e| {
-            ImgoptError::new(
-                PipelineStage::ManifestCommit,
-                ErrorKind::Io(format!(
-                    "failed to persist temporary manifest file to target: {}",
-                    e.error
-                )),
+                ErrorKind::Io(format!("failed to save manifest atomically: {e}")),
             )
             .with_path(&self.path)
         })?;

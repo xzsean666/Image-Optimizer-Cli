@@ -13,30 +13,34 @@ pub fn unix_to_utc_components(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let minute = ((rem % 3600) / 60) as u32;
     let second = (rem % 60) as u32;
 
-    let mut y = 1970i64;
-    let mut d = days;
-    loop {
-        let leap = i64::from((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0));
-        let days_in_year = 365 + leap;
-        if d < days_in_year {
-            break;
-        }
-        d -= days_in_year;
-        y += 1;
-    }
+    // Howard Hinnant's O(1) civil-from-days algorithm
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    y += i64::from(m <= 2);
+    (y, m, d, hour, minute, second)
+}
 
-    let leap = i64::from((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0));
-    let month_days = [31, 28 + leap, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 1u32;
-    for &md in &month_days {
-        if d < md {
-            break;
-        }
-        d -= md;
-        m += 1;
-    }
-    let day = (d + 1) as u32;
-    (y, m, day, hour, minute, second)
+/// Compute signed byte savings and savings ratio `(saved_bytes, saved_ratio)`
+/// without overflow when `optimized > original`.
+pub fn compute_byte_savings(original: u64, optimized: u64) -> (i64, f64) {
+    let saved_bytes = if original >= optimized {
+        i64::try_from(original - optimized).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(optimized - original).unwrap_or(i64::MAX)
+    };
+    let saved_ratio = if original > 0 {
+        saved_bytes as f64 / original as f64
+    } else {
+        0.0
+    };
+    (saved_bytes, saved_ratio)
 }
 
 /// Format current system UTC time as RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
@@ -49,7 +53,7 @@ pub fn utc_now_rfc3339() -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
-/// Supported image formats for Image Optimizer V1.
+/// Supported image formats for Image Optimizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
@@ -57,6 +61,8 @@ pub enum ImageFormat {
     Jpeg,
     Png,
     Webp,
+    Avif,
+    Gif,
 }
 
 impl ImageFormat {
@@ -66,6 +72,8 @@ impl ImageFormat {
             Self::Jpeg => "jpg",
             Self::Png => "png",
             Self::Webp => "webp",
+            Self::Avif => "avif",
+            Self::Gif => "gif",
         }
     }
 
@@ -75,6 +83,8 @@ impl ImageFormat {
             Self::Jpeg => "image/jpeg",
             Self::Png => "image/png",
             Self::Webp => "image/webp",
+            Self::Avif => "image/avif",
+            Self::Gif => "image/gif",
         }
     }
 
@@ -82,7 +92,7 @@ impl ImageFormat {
     pub fn supports_alpha(&self) -> bool {
         match self {
             Self::Jpeg => false,
-            Self::Png | Self::Webp => true,
+            Self::Png | Self::Webp | Self::Avif | Self::Gif => true,
         }
     }
 
@@ -93,6 +103,8 @@ impl ImageFormat {
             "jpg" | "jpeg" | "jpe" | "jif" | "jfif" => Some(Self::Jpeg),
             "png" => Some(Self::Png),
             "webp" => Some(Self::Webp),
+            "avif" => Some(Self::Avif),
+            "gif" => Some(Self::Gif),
             _ => None,
         }
     }
@@ -104,6 +116,8 @@ impl ImageFormat {
             "image/jpeg" | "image/jpg" | "image/pjpeg" => Some(Self::Jpeg),
             "image/png" => Some(Self::Png),
             "image/webp" => Some(Self::Webp),
+            "image/avif" => Some(Self::Avif),
+            "image/gif" => Some(Self::Gif),
             _ => None,
         }
     }
@@ -113,6 +127,8 @@ impl ImageFormat {
             Self::Jpeg => "jpeg",
             Self::Png => "png",
             Self::Webp => "webp",
+            Self::Avif => "avif",
+            Self::Gif => "gif",
         }
     }
 }
@@ -132,6 +148,8 @@ impl FromStr for ImageFormat {
             "jpeg" | "jpg" => Ok(Self::Jpeg),
             "png" => Ok(Self::Png),
             "webp" => Ok(Self::Webp),
+            "avif" => Ok(Self::Avif),
+            "gif" => Ok(Self::Gif),
             unsupported => Err(ImgoptError::new(
                 PipelineStage::FormatDetection,
                 ErrorKind::UnsupportedFormat(format!(
@@ -320,6 +338,8 @@ impl From<imgopt_codecs::CodecFormat> for ImageFormat {
             imgopt_codecs::CodecFormat::Jpeg => Self::Jpeg,
             imgopt_codecs::CodecFormat::Png => Self::Png,
             imgopt_codecs::CodecFormat::Webp => Self::Webp,
+            imgopt_codecs::CodecFormat::Avif => Self::Avif,
+            imgopt_codecs::CodecFormat::Gif => Self::Gif,
         }
     }
 }
@@ -330,6 +350,8 @@ impl From<ImageFormat> for imgopt_codecs::CodecFormat {
             ImageFormat::Jpeg => Self::Jpeg,
             ImageFormat::Png => Self::Png,
             ImageFormat::Webp => Self::Webp,
+            ImageFormat::Avif => Self::Avif,
+            ImageFormat::Gif => Self::Gif,
         }
     }
 }
@@ -392,7 +414,9 @@ mod tests {
         );
         assert_eq!(ImageFormat::from_extension("png"), Some(ImageFormat::Png));
         assert_eq!(ImageFormat::from_extension("webp"), Some(ImageFormat::Webp));
-        assert_eq!(ImageFormat::from_extension("gif"), None);
+        assert_eq!(ImageFormat::from_extension("avif"), Some(ImageFormat::Avif));
+        assert_eq!(ImageFormat::from_extension("gif"), Some(ImageFormat::Gif));
+        assert_eq!(ImageFormat::from_extension("bmp"), None);
 
         assert_eq!(
             ImageFormat::from_mime_type("image/jpeg"),
@@ -406,16 +430,28 @@ mod tests {
             ImageFormat::from_mime_type("image/webp"),
             Some(ImageFormat::Webp)
         );
-        assert_eq!(ImageFormat::from_mime_type("image/avif"), None);
+        assert_eq!(
+            ImageFormat::from_mime_type("image/avif"),
+            Some(ImageFormat::Avif)
+        );
+        assert_eq!(
+            ImageFormat::from_mime_type("image/gif"),
+            Some(ImageFormat::Gif)
+        );
+        assert_eq!(ImageFormat::from_mime_type("image/jxl"), None);
 
         assert_eq!(ImageFormat::Jpeg.extension(), "jpg");
         assert_eq!(ImageFormat::Png.extension(), "png");
         assert_eq!(ImageFormat::Webp.extension(), "webp");
+        assert_eq!(ImageFormat::Avif.extension(), "avif");
+        assert_eq!(ImageFormat::Gif.extension(), "gif");
 
         assert_eq!("jpeg".parse::<ImageFormat>().unwrap(), ImageFormat::Jpeg);
         assert_eq!("png".parse::<ImageFormat>().unwrap(), ImageFormat::Png);
         assert_eq!("webp".parse::<ImageFormat>().unwrap(), ImageFormat::Webp);
-        assert!("gif".parse::<ImageFormat>().is_err());
+        assert_eq!("avif".parse::<ImageFormat>().unwrap(), ImageFormat::Avif);
+        assert_eq!("gif".parse::<ImageFormat>().unwrap(), ImageFormat::Gif);
+        assert!("bmp".parse::<ImageFormat>().is_err());
     }
 
     #[test]
@@ -424,6 +460,17 @@ mod tests {
         assert_eq!(dim.pixel_count(), 1920 * 1080);
         assert!((dim.aspect_ratio() - (1920.0 / 1080.0)).abs() < 1e-6);
         assert_eq!(dim.to_string(), "1920x1080");
+    }
+
+    #[test]
+    fn test_unix_to_utc_components_o1() {
+        assert_eq!(unix_to_utc_components(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(
+            unix_to_utc_components(1_700_000_000),
+            (2023, 11, 14, 22, 13, 20)
+        );
+        // Must complete instantaneously in O(1) without looping
+        let _ = unix_to_utc_components(u64::MAX);
     }
 
     #[test]

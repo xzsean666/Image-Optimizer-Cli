@@ -61,6 +61,39 @@ impl SyncManifest for ManifestSyncAdapter {
         }
     }
 
+    fn evaluate_for_target(
+        &self,
+        source_sha256: &str,
+        current_opt_key: &str,
+        bucket: &str,
+        expected_object_key: Option<&str>,
+    ) -> SyncPlanAction {
+        let action = self.evaluate(source_sha256, current_opt_key);
+        if matches!(action, SyncPlanAction::SkipUpToDate { .. }) {
+            if let Some(st) = self
+                .manifest
+                .get(source_sha256)
+                .and_then(|e| e.storage.as_ref())
+            {
+                if st.bucket != bucket {
+                    return SyncPlanAction::Reprocess {
+                        source_sha256: source_sha256.to_string(),
+                        reason: "target storage bucket changed".into(),
+                    };
+                }
+                if let Some(exp_key) = expected_object_key {
+                    if st.object_key != exp_key {
+                        return SyncPlanAction::Reprocess {
+                            source_sha256: source_sha256.to_string(),
+                            reason: "target object key prefix changed".into(),
+                        };
+                    }
+                }
+            }
+        }
+        action
+    }
+
     fn record_success(
         &mut self,
         source_path: &str,
@@ -125,5 +158,71 @@ impl SyncManifest for ManifestSyncAdapter {
                 imgopt_core::ErrorKind::Io(e.to_string()),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imgopt_core::{Dimensions, ImageFormat};
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_evaluate_for_target_detects_bucket_and_prefix_changes() {
+        let temp = TempDir::new().unwrap();
+        let store = ManifestStore::new(temp.path().join("manifest.json"));
+        let mut adapter = ManifestSyncAdapter::new(store, "0.1.0").unwrap();
+
+        let sha = "a".repeat(64);
+        adapter.manifest.insert(ManifestEntry {
+            source: ManifestSourceRecord {
+                sha256: sha.clone(),
+                format: ImageFormat::Png,
+                byte_size: 100,
+                dimensions: Dimensions::new(8, 8),
+            },
+            optimization: Some(ManifestOptimizationRecord {
+                optimization_key: "key-1".into(),
+                output_format: ImageFormat::Webp,
+                output_size: 50,
+                quality_score: Some(0.95),
+                preset: "balanced".into(),
+                completed_at: "2026-11-25T00:00:00Z".into(),
+            }),
+            storage: Some(ManifestStorageRecord {
+                bucket: "bucket-a".into(),
+                object_key: format!("v1/images/{sha}/optimized.webp"),
+                etag: Some("etag".into()),
+                public_url: None,
+                uploaded_at: "2026-11-25T00:00:00Z".into(),
+                verified: true,
+            }),
+            status: EntryStatus::Uploaded,
+            known_paths: vec!["a.png".into()],
+        });
+
+        let same_target = adapter.evaluate_for_target(
+            &sha,
+            "key-1",
+            "bucket-a",
+            Some(&format!("v1/images/{sha}/optimized.webp")),
+        );
+        assert!(matches!(same_target, SyncPlanAction::SkipUpToDate { .. }));
+
+        let diff_bucket = adapter.evaluate_for_target(
+            &sha,
+            "key-1",
+            "bucket-b",
+            Some(&format!("v1/images/{sha}/optimized.webp")),
+        );
+        assert!(matches!(diff_bucket, SyncPlanAction::Reprocess { .. }));
+
+        let diff_prefix = adapter.evaluate_for_target(
+            &sha,
+            "key-1",
+            "bucket-a",
+            Some(&format!("v2/images/{sha}/optimized.webp")),
+        );
+        assert!(matches!(diff_prefix, SyncPlanAction::Reprocess { .. }));
     }
 }

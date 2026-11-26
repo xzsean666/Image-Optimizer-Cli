@@ -6,6 +6,8 @@ pub enum CodecFormat {
     Jpeg,
     Png,
     Webp,
+    Avif,
+    Gif,
 }
 
 impl CodecFormat {
@@ -14,6 +16,8 @@ impl CodecFormat {
             Self::Jpeg => "jpeg",
             Self::Png => "png",
             Self::Webp => "webp",
+            Self::Avif => "avif",
+            Self::Gif => "gif",
         }
     }
 }
@@ -179,6 +183,23 @@ impl DecodedPixels {
         };
         self.data.len() == expected
     }
+}
+
+/// A single decoded animation frame in RGBA8 layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimationFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub delay_millis: u32,
+}
+
+/// A decoded multi-frame animation sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedAnimation {
+    pub width: u32,
+    pub height: u32,
+    pub frames: Vec<AnimationFrame>,
 }
 
 /// Encoding parameters passed to codec adapters.

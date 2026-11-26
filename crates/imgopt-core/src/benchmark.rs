@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::OptimizationConfig;
 use crate::error::Result;
 use crate::executor::{execute_batch_scoped, BatchOptions, BatchTask};
-use crate::model::ImageFormat;
+use crate::model::{compute_byte_savings, ImageFormat};
 use crate::optimizer::OptimizationService;
 use crate::scanner::{scan_path, ScanOptions};
 
@@ -64,13 +64,23 @@ pub fn run_benchmark_with_concurrency(
     config: &OptimizationConfig,
     concurrency: usize,
 ) -> Result<BenchmarkReport> {
+    run_benchmark_with_options(dataset_path, config, concurrency, &ScanOptions::default())
+}
+
+/// Run optimization benchmark using bounded concurrency and custom scan options.
+pub fn run_benchmark_with_options(
+    dataset_path: &Path,
+    config: &OptimizationConfig,
+    concurrency: usize,
+    scan_options: &ScanOptions,
+) -> Result<BenchmarkReport> {
     let start_time = Instant::now();
     config.validate()?;
 
     let version = env!("CARGO_PKG_VERSION");
     let service = OptimizationService::new(version);
 
-    let scan_res = scan_path(dataset_path, &ScanOptions::default())?;
+    let scan_res = scan_path(dataset_path, scan_options)?;
     let tasks: Vec<BatchTask<u64>> = scan_res
         .files
         .iter()
@@ -115,7 +125,7 @@ pub fn run_benchmark_with_concurrency(
         }
     });
 
-    let mut cases = Vec::with_capacity(batch_results.len());
+    let mut cases = Vec::with_capacity(batch_results.len() + scan_res.errors.len());
     let mut total_original = 0u64;
     let mut total_optimized = 0u64;
     let mut success_count = 0usize;
@@ -136,16 +146,26 @@ pub fn run_benchmark_with_concurrency(
         }
     }
 
-    let total_saved = if total_original >= total_optimized {
-        i64::try_from(total_original - total_optimized).unwrap_or(i64::MAX)
-    } else {
-        -i64::try_from(total_optimized - total_original).unwrap_or(i64::MAX)
-    };
-    let overall_ratio = if total_original > 0 && total_saved > 0 {
-        total_saved as f64 / total_original as f64
-    } else {
-        0.0
-    };
+    for scan_err in &scan_res.errors {
+        fail_count += 1;
+        cases.push(BenchmarkCaseResult {
+            path: scan_err
+                .source_path
+                .clone()
+                .unwrap_or_else(|| dataset_path.to_path_buf()),
+            format: None,
+            original_bytes: 0,
+            optimized_bytes: None,
+            savings_ratio: None,
+            quality_score: None,
+            psnr_score: None,
+            elapsed_millis: 0,
+            error: Some(scan_err.to_string()),
+        });
+    }
+
+    let (total_saved, raw_ratio) = compute_byte_savings(total_original, total_optimized);
+    let overall_ratio = if total_saved > 0 { raw_ratio } else { 0.0 };
 
     let average_quality_score = if success_count > 0 {
         sum_quality / (success_count as f64)

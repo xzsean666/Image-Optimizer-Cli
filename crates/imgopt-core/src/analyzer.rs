@@ -31,10 +31,7 @@ impl Default for ResourceLimits {
 
 impl ResourceLimits {
     pub fn to_decode_limits(&self) -> DecodeLimits {
-        let max_alloc_bytes = self
-            .max_pixels
-            .checked_mul(4)
-            .map(|b| b.max(1024 * 1024));
+        let max_alloc_bytes = self.max_pixels.checked_mul(4).map(|b| b.max(1024 * 1024));
         DecodeLimits {
             max_width: self.max_width,
             max_height: self.max_height,
@@ -75,8 +72,7 @@ pub fn read_file_bounded(path: &Path, max_bytes: u64, stage: PipelineStage) -> R
     let mut buf = Vec::with_capacity(capacity);
     let read_limit = max_bytes.saturating_add(1);
     file.take(read_limit).read_to_end(&mut buf).map_err(|e| {
-        ImgoptError::new(stage, ErrorKind::Io(format!("failed to read file: {e}")))
-            .with_path(path)
+        ImgoptError::new(stage, ErrorKind::Io(format!("failed to read file: {e}"))).with_path(path)
     })?;
 
     if (buf.len() as u64) > max_bytes {
@@ -136,9 +132,10 @@ pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<An
     let decoded = codec
         .decode_with_limits(bytes, &decode_limits)
         .map_err(|e| match e {
-            imgopt_codecs::CodecError::ResourceLimitExceeded(msg) => {
-                ImgoptError::new(PipelineStage::ResourceCheck, ErrorKind::ResourceLimitExceeded(msg))
-            }
+            imgopt_codecs::CodecError::ResourceLimitExceeded(msg) => ImgoptError::new(
+                PipelineStage::ResourceCheck,
+                ErrorKind::ResourceLimitExceeded(msg),
+            ),
             other => ImgoptError::new(
                 PipelineStage::Decode,
                 ErrorKind::Decode(format!("failed to decode image during analysis: {other}")),
@@ -335,8 +332,117 @@ pub(crate) fn probe_metadata_markers(bytes: &[u8], format: ImageFormat) -> Image
                 pos = next_pos;
             }
         }
+        ImageFormat::Avif => {
+            // Scan ISO BMFF container boxes for ICC ('colr' with 'prof'/'rICC') or Exif/XMP item markers
+            if bytes.windows(4).any(|w| w == b"prof" || w == b"rICC") {
+                meta.has_icc = true;
+            }
+            if bytes.windows(4).any(|w| w == b"Exif") {
+                meta.has_exif = true;
+            }
+            if bytes.windows(17).any(|w| w == b"application/rdf+x") {
+                meta.has_xmp = true;
+            }
+        }
+        ImageFormat::Gif => {
+            if bytes.windows(11).any(|w| w == b"XMP DataXMP") {
+                meta.has_xmp = true;
+            }
+        }
     }
     meta
+}
+
+/// Returns true if the container carries any ancillary metadata/text/comment chunks
+/// (EXIF, ICC, XMP, JPEG COM/APPn, PNG tEXt/zTXt/iTXt/tIME) that `StripAll` must remove.
+pub(crate) fn has_ancillary_metadata(bytes: &[u8], format: ImageFormat) -> bool {
+    let standard = probe_metadata_markers(bytes, format);
+    if standard.has_any() {
+        return true;
+    }
+
+    match format {
+        ImageFormat::Jpeg => {
+            if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+                return false;
+            }
+            let mut pos = 2usize;
+            while pos + 1 < bytes.len() {
+                if bytes[pos] != 0xFF {
+                    pos += 1;
+                    continue;
+                }
+                while pos < bytes.len() && bytes[pos] == 0xFF {
+                    pos += 1;
+                }
+                if pos >= bytes.len() {
+                    break;
+                }
+                let marker = bytes[pos];
+                pos += 1;
+                if marker == 0x00 || marker == 0x01 || (0xD0..=0xD9).contains(&marker) {
+                    if marker == 0xD9 {
+                        break;
+                    }
+                    continue;
+                }
+                if marker == 0xDA || pos + 2 > bytes.len() {
+                    break;
+                }
+                let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+                if seg_len < 2 || pos + seg_len > bytes.len() {
+                    break;
+                }
+                // 0xFE = COM comment; 0xE1..=0xEF = APP1..APP15 (excluding standard JFIF APP0 0xE0)
+                if marker == 0xFE || (0xE1..=0xEF).contains(&marker) {
+                    return true;
+                }
+                pos += seg_len;
+            }
+            false
+        }
+        ImageFormat::Png => {
+            if bytes.len() < 8 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+                return false;
+            }
+            let mut pos = 8usize;
+            while pos + 12 <= bytes.len() {
+                let len = u32::from_be_bytes([
+                    bytes[pos],
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                ]) as usize;
+                let chunk_type = &bytes[pos + 4..pos + 8];
+                let Some(next_pos) = pos
+                    .checked_add(8)
+                    .and_then(|p| p.checked_add(len))
+                    .and_then(|p| p.checked_add(4))
+                else {
+                    break;
+                };
+                if next_pos > bytes.len() {
+                    break;
+                }
+                if matches!(
+                    chunk_type,
+                    b"eXIf" | b"iCCP" | b"iTXt" | b"tEXt" | b"zTXt" | b"tIME"
+                ) {
+                    return true;
+                }
+                if chunk_type == b"IEND" {
+                    break;
+                }
+                pos = next_pos;
+            }
+            false
+        }
+        ImageFormat::Webp | ImageFormat::Avif => false,
+        ImageFormat::Gif => {
+            // GIF Comment extension (0x21 0xFE) or XMP Application Extension
+            bytes.windows(2).any(|w| w == [0x21, 0xFE])
+        }
+    }
 }
 
 fn inspect_characteristics(raw: &RawImage) -> ImageCharacteristics {
@@ -350,7 +456,7 @@ fn inspect_characteristics(raw: &RawImage) -> ImageCharacteristics {
         }
         ColorType::GrayscaleAlpha8 => {
             is_grayscale = true;
-            for chunk in raw.data.chunks_exact(2) {
+            for chunk in raw.data.as_chunks::<2>().0 {
                 if chunk[1] < 255 {
                     has_transparency = true;
                     break;
@@ -359,7 +465,7 @@ fn inspect_characteristics(raw: &RawImage) -> ImageCharacteristics {
         }
         ColorType::Rgb8 => {
             has_transparency = false;
-            for chunk in raw.data.chunks_exact(3) {
+            for chunk in raw.data.as_chunks::<3>().0 {
                 if chunk[0] != chunk[1] || chunk[1] != chunk[2] {
                     is_grayscale = false;
                     break;
@@ -367,7 +473,7 @@ fn inspect_characteristics(raw: &RawImage) -> ImageCharacteristics {
             }
         }
         ColorType::Rgba8 => {
-            for chunk in raw.data.chunks_exact(4) {
+            for chunk in raw.data.as_chunks::<4>().0 {
                 if chunk[3] < 255 {
                     has_transparency = true;
                 }

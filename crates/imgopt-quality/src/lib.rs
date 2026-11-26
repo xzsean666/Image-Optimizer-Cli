@@ -1,6 +1,9 @@
 pub mod metric;
 
-pub use metric::{compute_psnr, compute_quality_score, compute_ssim, QualityError, QualityScore};
+pub use metric::{
+    compute_perceptual_ssim, compute_psnr, compute_quality_score, compute_ssim, QualityError,
+    QualityScore,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

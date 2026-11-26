@@ -1,8 +1,9 @@
-use std::fs;
-use std::io::Write;
 use std::path::Path;
 
+use imgopt_core::compute_byte_savings;
 use serde::{Deserialize, Serialize};
+
+use crate::store::write_bytes_atomically;
 
 /// Status of an individual item in a sync or optimization run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,17 +103,8 @@ impl RunResult {
             }
         }
 
-        let saved_bytes = if original_bytes >= optimized_bytes {
-            i64::try_from(original_bytes - optimized_bytes).unwrap_or(i64::MAX)
-        } else {
-            -i64::try_from(optimized_bytes - original_bytes).unwrap_or(i64::MAX)
-        };
-
-        let saved_ratio = if original_bytes > 0 && saved_bytes > 0 {
-            saved_bytes as f64 / original_bytes as f64
-        } else {
-            0.0
-        };
+        let (saved_bytes, raw_ratio) = compute_byte_savings(original_bytes, optimized_bytes);
+        let saved_ratio = if saved_bytes > 0 { raw_ratio } else { 0.0 };
 
         RunSummary {
             total_files,
@@ -134,32 +126,16 @@ impl RunResult {
 
     /// Write this run result to the destination path atomically via exclusive temp file.
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
-        let dest = path.as_ref();
-        let parent = match dest.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
-
         let json_bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let mut tmp_file = tempfile::Builder::new()
-            .prefix(".tmp-result-")
-            .suffix(".json")
-            .tempfile_in(parent)?;
-        tmp_file.write_all(&json_bytes)?;
-        tmp_file.as_file().sync_all()?;
-        tmp_file.persist(dest).map_err(|e| e.error)?;
-        Ok(())
+        write_bytes_atomically(path.as_ref(), &json_bytes, ".tmp-result-", ".json")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]

@@ -73,6 +73,8 @@ impl FromStr for OptimizationPreset {
 pub enum MetadataPolicy {
     #[default]
     StripAll,
+    /// Strip privacy metadata (EXIF/XMP) while preserving ICC color profile.
+    PreserveIcc,
     PreserveAll,
     Custom {
         preserve_exif: bool,
@@ -84,7 +86,7 @@ pub enum MetadataPolicy {
 impl MetadataPolicy {
     pub const fn preserves_exif(&self) -> bool {
         match self {
-            Self::StripAll => false,
+            Self::StripAll | Self::PreserveIcc => false,
             Self::PreserveAll => true,
             Self::Custom { preserve_exif, .. } => *preserve_exif,
         }
@@ -93,14 +95,14 @@ impl MetadataPolicy {
     pub const fn preserves_icc(&self) -> bool {
         match self {
             Self::StripAll => false,
-            Self::PreserveAll => true,
+            Self::PreserveIcc | Self::PreserveAll => true,
             Self::Custom { preserve_icc, .. } => *preserve_icc,
         }
     }
 
     pub const fn preserves_xmp(&self) -> bool {
         match self {
-            Self::StripAll => false,
+            Self::StripAll | Self::PreserveIcc => false,
             Self::PreserveAll => true,
             Self::Custom { preserve_xmp, .. } => *preserve_xmp,
         }
@@ -114,10 +116,40 @@ pub enum OutputFormatPolicy {
     /// Keep the original image format.
     #[default]
     PreserveOriginal,
-    /// Allow converting JPEG/PNG to WebP if size is smaller.
+    /// Allow converting JPEG/PNG/GIF to WebP if size is smaller.
     AllowWebp,
+    /// Allow converting JPEG/PNG/WebP/GIF to AVIF if size is smaller.
+    AllowAvif,
+    /// Evaluate original, WebP, and AVIF and pick the smallest acceptable candidate.
+    Auto,
     /// Force a specific target format.
     Force(ImageFormat),
+}
+
+/// Resizing behavior when `resize_width` or `resize_height` is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResizeMode {
+    /// Fit within bounds preserving aspect ratio; never upscale beyond original dimensions.
+    #[default]
+    ScaleDown,
+    /// Fit within bounds preserving aspect ratio (allows upscaling).
+    Contain,
+    /// Fill target dimensions completely by center-cropping excess edges.
+    Cover,
+    /// Resize to exact target dimensions.
+    Exact,
+}
+
+impl From<ResizeMode> for imgopt_codecs::ResizeMode {
+    fn from(m: ResizeMode) -> Self {
+        match m {
+            ResizeMode::ScaleDown => Self::ScaleDown,
+            ResizeMode::Contain => Self::Contain,
+            ResizeMode::Cover => Self::Cover,
+            ResizeMode::Exact => Self::Exact,
+        }
+    }
 }
 
 /// Complete optimization configuration.
@@ -132,6 +164,18 @@ pub struct OptimizationConfig {
     pub max_height: Option<u32>,
     pub max_input_bytes: u64,
     pub max_pixels: u64,
+    #[serde(default)]
+    pub resize_width: Option<u32>,
+    #[serde(default)]
+    pub resize_height: Option<u32>,
+    #[serde(default)]
+    pub resize_mode: ResizeMode,
+    #[serde(default = "default_convert_to_srgb")]
+    pub convert_to_srgb: bool,
+}
+
+const fn default_convert_to_srgb() -> bool {
+    true
 }
 
 impl Default for OptimizationConfig {
@@ -149,10 +193,14 @@ impl OptimizationConfig {
             effort: preset.default_effort(),
             metadata_policy: MetadataPolicy::StripAll,
             output_format_policy: OutputFormatPolicy::PreserveOriginal,
-            max_width: None,
-            max_height: None,
+            max_width: Some(16_384),
+            max_height: Some(16_384),
             max_input_bytes: 100 * 1024 * 1024, // 100 MB
             max_pixels: 64 * 1024 * 1024,       // 64 Megapixels (e.g. 8192x8192)
+            resize_width: None,
+            resize_height: None,
+            resize_mode: ResizeMode::ScaleDown,
+            convert_to_srgb: true,
         }
     }
 
@@ -196,6 +244,24 @@ impl OptimizationConfig {
             }
         }
 
+        if let Some(w) = self.resize_width {
+            if w == 0 {
+                return Err(ImgoptError::new(
+                    PipelineStage::Config,
+                    ErrorKind::Configuration("resize_width cannot be 0".into()),
+                ));
+            }
+        }
+
+        if let Some(h) = self.resize_height {
+            if h == 0 {
+                return Err(ImgoptError::new(
+                    PipelineStage::Config,
+                    ErrorKind::Configuration("resize_height cannot be 0".into()),
+                ));
+            }
+        }
+
         if self.max_input_bytes == 0 {
             return Err(ImgoptError::new(
                 PipelineStage::Config,
@@ -217,7 +283,7 @@ impl OptimizationConfig {
     /// for cache and optimization-key derivation.
     pub fn normalized_key_component(&self) -> String {
         format!(
-            "preset={}|q={:.4}|effort={}|meta={:?}|format={:?}|max_dim={:?}x{:?}",
+            "preset={}|q={:.4}|effort={}|meta={:?}|format={:?}|max_dim={:?}x{:?}|resize={:?}x{:?}:{:?}|srgb={}",
             self.preset.as_str(),
             self.quality_target,
             self.effort,
@@ -225,6 +291,10 @@ impl OptimizationConfig {
             self.output_format_policy,
             self.max_width,
             self.max_height,
+            self.resize_width,
+            self.resize_height,
+            self.resize_mode,
+            self.convert_to_srgb,
         )
     }
 }

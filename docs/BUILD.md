@@ -4,19 +4,20 @@ This document describes how to build, test, and verify the `Image-Optimizer-Cli`
 
 ## System Prerequisites
 
-- **Rust**: Version `1.89.0` or newer (managed via `rust-toolchain.toml` or `rustup`).
+- **Rust**: Version `1.88.0` or newer (`stable` channel managed via `rust-toolchain.toml` or `rustup`).
 - **Cargo**: Bundled with standard Rust distributions.
 - **Git**: For version control.
 
 ## Workspace Architecture
 
-The workspace contains 6 member crates:
-1. `crates/imgopt-codecs`: Image encoding and decoding adapters.
-2. `crates/imgopt-quality`: SSIM and PSNR quality measurement.
-3. `crates/imgopt-core`: Core pipeline, hashing, analysis, candidate search, and sync service.
-4. `crates/imgopt-manifest`: Atomic manifest store, deduplication logic, and JSON results.
-5. `crates/imgopt-storage`: S3/R2 object storage integration, retry backoff, and URL building.
-6. `crates/imgopt-cli`: Command-line interface and binary executable (`imgopt`).
+The workspace contains 7 member crates:
+1. `crates/imgopt`: Unified Rust library facade (`imgopt`).
+2. `crates/imgopt-codecs`: Image encoding and decoding adapters.
+3. `crates/imgopt-quality`: SSIM and PSNR quality measurement.
+4. `crates/imgopt-core`: Core pipeline, hashing, analysis, candidate search, and sync service.
+5. `crates/imgopt-manifest`: Atomic manifest store, deduplication logic, and JSON results.
+6. `crates/imgopt-storage`: S3/R2 object storage integration, retry backoff, and URL building.
+7. `crates/imgopt-cli`: Command-line interface and binary executable (`imgopt`).
 
 ## Build Commands
 

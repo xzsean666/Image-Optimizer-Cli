@@ -68,24 +68,36 @@ impl ImageCodec for JpegCodec {
         if options.effort >= 4 {
             encoder.set_progressive(true);
         }
-        if options.effort >= 2 {
-            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_2_0);
-        } else {
+        // Use 4:4:4 chroma when near-lossless quality is requested or effort == 1,
+        // so high-SSIM targets (e.g. Maximum preset) remain achievable on sharp graphics.
+        if quality >= 95 || options.effort <= 1 {
             encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
+        } else {
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_2_0);
         }
 
         let preserve = options.effective_preservation();
         if preserve.preserve_icc {
             if let Some(ref icc) = pixels.metadata.icc_profile {
                 if !icc.is_empty() {
-                    let _ = encoder.add_icc_profile(icc);
+                    encoder.add_icc_profile(icc).map_err(|e| {
+                        CodecError::EncodeError(format!("failed to embed JPEG ICC profile: {e}"))
+                    })?;
                 }
             }
         }
         if preserve.preserve_exif {
             if let Some(ref exif) = pixels.metadata.exif {
-                if !exif.is_empty() && exif.len() <= 65_527 {
-                    let _ = encoder.add_exif_metadata(exif);
+                if !exif.is_empty() {
+                    if exif.len() > 65_527 {
+                        return Err(CodecError::EncodeError(format!(
+                            "EXIF payload ({} bytes) exceeds JPEG APP1 65527-byte limit",
+                            exif.len()
+                        )));
+                    }
+                    encoder.add_exif_metadata(exif).map_err(|e| {
+                        CodecError::EncodeError(format!("failed to embed JPEG EXIF metadata: {e}"))
+                    })?;
                 }
             }
         }
@@ -97,9 +109,15 @@ impl ImageCodec for JpegCodec {
                         seg.extend_from_slice(XMP_HEADER);
                     }
                     seg.extend_from_slice(xmp);
-                    if seg.len() <= 65_533 {
-                        let _ = encoder.add_app_segment(1, seg);
+                    if seg.len() > 65_533 {
+                        return Err(CodecError::EncodeError(format!(
+                            "XMP payload ({} bytes) exceeds JPEG APP1 65533-byte limit",
+                            seg.len()
+                        )));
                     }
+                    encoder.add_app_segment(1, seg).map_err(|e| {
+                        CodecError::EncodeError(format!("failed to embed JPEG XMP metadata: {e}"))
+                    })?;
                 }
             }
         }
@@ -128,7 +146,12 @@ impl ImageCodec for JpegCodec {
             PixelFormat::Rgba8 => {
                 let rgb_data = flatten_rgba_on_white(&pixels.data);
                 encoder
-                    .encode(&rgb_data, width_u16, height_u16, jpeg_encoder::ColorType::Rgb)
+                    .encode(
+                        &rgb_data,
+                        width_u16,
+                        height_u16,
+                        jpeg_encoder::ColorType::Rgb,
+                    )
                     .map_err(|e| CodecError::EncodeError(format!("JPEG encode error: {e}")))?;
             }
             PixelFormat::GrayscaleAlpha8 => {
@@ -156,7 +179,7 @@ impl ImageCodec for JpegCodec {
 
 fn flatten_rgba_on_white(rgba: &[u8]) -> Vec<u8> {
     let mut rgb_data = Vec::with_capacity((rgba.len() / 4) * 3);
-    for chunk in rgba.chunks_exact(4) {
+    for chunk in rgba.as_chunks::<4>().0 {
         let a = u32::from(chunk[3]);
         let inv = 255 - a;
         rgb_data.push(((u32::from(chunk[0]) * a + 255 * inv) / 255) as u8);
@@ -168,7 +191,7 @@ fn flatten_rgba_on_white(rgba: &[u8]) -> Vec<u8> {
 
 fn flatten_la_on_white(la: &[u8]) -> Vec<u8> {
     let mut gray_data = Vec::with_capacity(la.len() / 2);
-    for chunk in la.chunks_exact(2) {
+    for chunk in la.as_chunks::<2>().0 {
         let a = u32::from(chunk[1]);
         let inv = 255 - a;
         gray_data.push(((u32::from(chunk[0]) * a + 255 * inv) / 255) as u8);
@@ -240,7 +263,9 @@ mod tests {
         let codec = JpegCodec;
         // Construct invalid-for-JPEG dimension without allocating multi-GB via manual check
         let pixels = DecodedPixels::new(70_000, 1, PixelFormat::Grayscale8, vec![0; 70_000]);
-        let err = codec.encode(&pixels, &EncodeOptions::default()).unwrap_err();
+        let err = codec
+            .encode(&pixels, &EncodeOptions::default())
+            .unwrap_err();
         assert!(matches!(err, CodecError::InvalidParameter(_)));
     }
 
@@ -275,11 +300,11 @@ mod tests {
         };
         let encoded = codec.encode(&pixels, &opts_preserve).unwrap();
         let decoded = codec.decode(&encoded.bytes).unwrap();
-        assert_eq!(decoded.metadata.icc_profile.as_deref(), Some(icc.as_slice()));
         assert_eq!(
-            decoded.metadata.exif.as_deref(),
-            Some(exif_tiff.as_slice())
+            decoded.metadata.icc_profile.as_deref(),
+            Some(icc.as_slice())
         );
+        assert_eq!(decoded.metadata.exif.as_deref(), Some(exif_tiff.as_slice()));
         assert_eq!(decoded.metadata.xmp.as_deref(), Some(xmp.as_slice()));
 
         let encoded_stripped = codec.encode(&pixels, &EncodeOptions::default()).unwrap();

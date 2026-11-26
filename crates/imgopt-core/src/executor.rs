@@ -1,11 +1,70 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
 use crate::error::ImgoptError;
+
+/// Bounded decoded-memory coordinator preventing concurrent workers from exceeding a memory budget.
+#[derive(Debug)]
+pub struct MemoryBudget {
+    max_bytes: u64,
+    used_bytes: Mutex<u64>,
+    condvar: Condvar,
+}
+
+/// RAII lease releasing reserved memory budget on drop.
+#[derive(Debug)]
+pub struct MemoryLease<'a> {
+    budget: &'a MemoryBudget,
+    bytes: u64,
+}
+
+impl Drop for MemoryLease<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+impl MemoryBudget {
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes: max_bytes.max(1),
+            used_bytes: Mutex::new(0),
+            condvar: Condvar::new(),
+        }
+    }
+
+    pub fn acquire(&self, bytes: u64) -> MemoryLease<'_> {
+        let clamped = bytes.min(self.max_bytes);
+        let mut used = match self.used_bytes.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while *used > 0 && (*used).saturating_add(clamped) > self.max_bytes {
+            used = match self.condvar.wait(used) {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        *used = (*used).saturating_add(clamped);
+        MemoryLease {
+            budget: self,
+            bytes: clamped,
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut used = match self.used_bytes.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *used = used.saturating_sub(bytes);
+        self.condvar.notify_all();
+    }
+}
 
 /// Configuration for batch execution concurrency and error tolerance.
 #[derive(Debug, Clone, PartialEq, Eq)]

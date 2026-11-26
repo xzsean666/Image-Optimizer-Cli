@@ -10,13 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+imgopt-codecs = { path = "../imgopt-codecs" }
 imgopt-core = { path = "../imgopt-core" }
 imgopt-manifest = { path = "../imgopt-manifest" }
 imgopt-storage = { path = "../imgopt-storage" }
-serde = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
-
-[dev-dependencies]
-imgopt-codecs = { path = "../imgopt-codecs" }
 tempfile = { workspace = true }

@@ -5,10 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+globset = { workspace = true }
 hex = { workspace = true }
 imgopt-codecs = { path = "../imgopt-codecs" }
 imgopt-quality = { path = "../imgopt-quality" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
 tempfile = { workspace = true }

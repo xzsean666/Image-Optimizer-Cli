@@ -12,6 +12,7 @@ pub struct UploadRequest {
     pub body: Vec<u8>,
     pub content_type: String,
     pub content_sha256: Option<String>,
+    pub cache_control: Option<String>,
 }
 
 impl UploadRequest {
@@ -27,6 +28,7 @@ impl UploadRequest {
             body,
             content_type: content_type.into(),
             content_sha256: None,
+            cache_control: None,
         }
     }
 
@@ -34,6 +36,19 @@ impl UploadRequest {
         self.content_sha256 = Some(sha256.into());
         self
     }
+
+    pub fn with_cache_control(mut self, cache_control: impl Into<String>) -> Self {
+        self.cache_control = Some(cache_control.into());
+        self
+    }
+}
+
+/// Summary of an object returned by listing storage objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    pub object_key: String,
+    pub byte_size: u64,
+    pub etag: Option<String>,
 }
 
 /// Metadata returned after a successful upload.
@@ -113,6 +128,13 @@ pub trait ObjectStorage: Send + Sync {
 
     /// Delete an object from remote storage.
     fn delete_object(&self, bucket: &str, object_key: &str) -> Result<(), StorageError>;
+
+    /// List objects in a bucket under an optional key prefix.
+    fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ListedObject>, StorageError>;
 }
 
 type StorageKey = (String, String);
@@ -207,6 +229,26 @@ impl ObjectStorage for MemoryObjectStorage {
         guard.remove(&(bucket.to_string(), object_key.to_string()));
         Ok(())
     }
+
+    fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<ListedObject>, StorageError> {
+        let clean_prefix = prefix.unwrap_or("").trim_start_matches('/');
+        let guard = self.objects.lock().unwrap();
+        let mut out: Vec<ListedObject> = guard
+            .iter()
+            .filter(|((b, k), _)| b == bucket && k.starts_with(clean_prefix))
+            .map(|((_, k), (_, meta))| ListedObject {
+                object_key: k.clone(),
+                byte_size: meta.byte_size,
+                etag: meta.etag.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.object_key.cmp(&b.object_key));
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -216,13 +258,12 @@ mod tests {
     #[test]
     fn test_memory_storage_put_head_delete() {
         let storage = MemoryObjectStorage::new();
-        let req = UploadRequest {
-            bucket: "my-bucket".into(),
-            object_key: "images/cat.webp".into(),
-            body: vec![1, 2, 3, 4],
-            content_type: "image/webp".into(),
-            content_sha256: None,
-        };
+        let req = UploadRequest::new(
+            "my-bucket",
+            "images/cat.webp",
+            vec![1, 2, 3, 4],
+            "image/webp",
+        );
 
         let put_res = storage.put_object(&req).unwrap();
         assert_eq!(put_res.byte_size, 4);
@@ -231,6 +272,10 @@ mod tests {
         assert!(head.is_some());
         let meta = head.unwrap();
         assert_eq!(meta.byte_size, 4);
+
+        let listed = storage.list_objects("my-bucket", Some("images/")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].object_key, "images/cat.webp");
 
         storage
             .delete_object("my-bucket", "images/cat.webp")
@@ -244,13 +289,7 @@ mod tests {
         let storage = MemoryObjectStorage::new();
         storage.fail_next_n_puts(1);
 
-        let req = UploadRequest {
-            bucket: "my-bucket".into(),
-            object_key: "images/dog.webp".into(),
-            body: vec![1, 2, 3],
-            content_type: "image/webp".into(),
-            content_sha256: None,
-        };
+        let req = UploadRequest::new("my-bucket", "images/dog.webp", vec![1, 2, 3], "image/webp");
 
         let res1 = storage.put_object(&req);
         assert!(res1.is_err());

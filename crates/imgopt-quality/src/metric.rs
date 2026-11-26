@@ -128,13 +128,7 @@ pub fn compute_ssim(
     let num_blocks_x = width.div_ceil(BLOCK_SIZE);
     let num_blocks_y = height.div_ceil(BLOCK_SIZE);
     let row_stride = width * channels;
-
-    // Evaluate visible color channels (skip pure alpha channel if RGBA/LA to measure visual color fidelity)
-    let color_channels = if channels == 4 || channels == 2 {
-        channels - 1
-    } else {
-        channels
-    };
+    let active_ch = channels.min(4);
 
     let mut total_ssim = 0.0f64;
     let mut total_blocks_evaluated = 0usize;
@@ -154,74 +148,81 @@ pub fn compute_ssim(
             }
             let n = n_pixels as f64;
 
-            // Accumulate all visible channels together in sequential row memory order
-            let mut sum_x = [0u64; 3];
-            let mut sum_y = [0u64; 3];
-            let mut sum_xx = [0u64; 3];
-            let mut sum_yy = [0u64; 3];
-            let mut sum_xy = [0u64; 3];
+            // Accumulate all channels (including alpha) together in sequential row memory order
+            let mut sum_x = [0u64; 4];
+            let mut sum_y = [0u64; 4];
+            let mut sum_xx = [0u64; 4];
+            let mut sum_yy = [0u64; 4];
+            let mut sum_xy = [0u64; 4];
 
-            for y in start_y..end_y {
-                let row_start = y * row_stride + start_x * channels;
-                let row_end = row_start + w_block * channels;
-                let orig_row = &orig[row_start..row_end];
-                let cand_row = &cand[row_start..row_end];
-
-                match (channels, color_channels) {
-                    (3, 3) => {
-                        for (op, cp) in orig_row.chunks_exact(3).zip(cand_row.chunks_exact(3)) {
-                            for ch in 0..3 {
-                                let vx = u64::from(op[ch]);
-                                let vy = u64::from(cp[ch]);
-                                sum_x[ch] += vx;
-                                sum_y[ch] += vy;
-                                sum_xx[ch] += vx * vx;
-                                sum_yy[ch] += vy * vy;
-                                sum_xy[ch] += vx * vy;
-                            }
-                        }
-                    }
-                    (4, 3) => {
-                        for (op, cp) in orig_row.chunks_exact(4).zip(cand_row.chunks_exact(4)) {
-                            for ch in 0..3 {
-                                let vx = u64::from(op[ch]);
-                                let vy = u64::from(cp[ch]);
-                                sum_x[ch] += vx;
-                                sum_y[ch] += vy;
-                                sum_xx[ch] += vx * vx;
-                                sum_yy[ch] += vy * vy;
-                                sum_xy[ch] += vx * vy;
-                            }
-                        }
-                    }
-                    (1, 1) => {
-                        for (&ox, &cy) in orig_row.iter().zip(cand_row.iter()) {
-                            let vx = u64::from(ox);
-                            let vy = u64::from(cy);
-                            sum_x[0] += vx;
-                            sum_y[0] += vy;
-                            sum_xx[0] += vx * vx;
-                            sum_yy[0] += vy * vy;
-                            sum_xy[0] += vx * vy;
-                        }
-                    }
-                    (2, 1) => {
-                        for (op, cp) in orig_row.chunks_exact(2).zip(cand_row.chunks_exact(2)) {
-                            let vx = u64::from(op[0]);
-                            let vy = u64::from(cp[0]);
-                            sum_x[0] += vx;
-                            sum_y[0] += vy;
-                            sum_xx[0] += vx * vx;
-                            sum_yy[0] += vy * vy;
-                            sum_xy[0] += vx * vy;
-                        }
-                    }
-                    _ => {
+            match channels {
+                1 => accumulate_block::<1>(
+                    orig,
+                    cand,
+                    row_stride,
+                    start_x,
+                    w_block,
+                    start_y,
+                    end_y,
+                    &mut sum_x,
+                    &mut sum_y,
+                    &mut sum_xx,
+                    &mut sum_yy,
+                    &mut sum_xy,
+                ),
+                2 => accumulate_block::<2>(
+                    orig,
+                    cand,
+                    row_stride,
+                    start_x,
+                    w_block,
+                    start_y,
+                    end_y,
+                    &mut sum_x,
+                    &mut sum_y,
+                    &mut sum_xx,
+                    &mut sum_yy,
+                    &mut sum_xy,
+                ),
+                3 => accumulate_block::<3>(
+                    orig,
+                    cand,
+                    row_stride,
+                    start_x,
+                    w_block,
+                    start_y,
+                    end_y,
+                    &mut sum_x,
+                    &mut sum_y,
+                    &mut sum_xx,
+                    &mut sum_yy,
+                    &mut sum_xy,
+                ),
+                4 => accumulate_block::<4>(
+                    orig,
+                    cand,
+                    row_stride,
+                    start_x,
+                    w_block,
+                    start_y,
+                    end_y,
+                    &mut sum_x,
+                    &mut sum_y,
+                    &mut sum_xx,
+                    &mut sum_yy,
+                    &mut sum_xy,
+                ),
+                _ => {
+                    for y in start_y..end_y {
+                        let row_start = y * row_stride + start_x * channels;
+                        let row_end = row_start + w_block * channels;
+                        let orig_row = &orig[row_start..row_end];
+                        let cand_row = &cand[row_start..row_end];
                         for (op, cp) in orig_row
                             .chunks_exact(channels)
                             .zip(cand_row.chunks_exact(channels))
                         {
-                            for ch in 0..color_channels.min(3) {
+                            for ch in 0..active_ch {
                                 let vx = u64::from(op[ch]);
                                 let vy = u64::from(cp[ch]);
                                 sum_x[ch] += vx;
@@ -235,7 +236,6 @@ pub fn compute_ssim(
                 }
             }
 
-            let active_ch = color_channels.min(3);
             for ch in 0..active_ch {
                 let sx = sum_x[ch] as f64;
                 let sy = sum_y[ch] as f64;
@@ -269,6 +269,78 @@ pub fn compute_ssim(
 
     let mean_ssim = total_ssim / (total_blocks_evaluated as f64);
     Ok(mean_ssim.clamp(0.0, 1.0))
+}
+
+/// Compute perceptual SSIM prioritizing human luminance sensitivity (Rec.601 luma)
+/// while still detecting chroma shifts and alpha-channel degradation.
+pub fn compute_perceptual_ssim(
+    orig: &[u8],
+    cand: &[u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<f64, QualityError> {
+    validate_buffers(orig, cand, width, height, channels)?;
+    if channels < 3 {
+        return compute_ssim(orig, cand, width, height, channels);
+    }
+
+    let num_pixels = width * height;
+    let mut orig_y = Vec::with_capacity(num_pixels);
+    let mut cand_y = Vec::with_capacity(num_pixels);
+    for (op, cp) in orig.chunks_exact(channels).zip(cand.chunks_exact(channels)) {
+        let oy = ((u32::from(op[0]) * 299 + u32::from(op[1]) * 587 + u32::from(op[2]) * 114 + 500)
+            / 1000) as u8;
+        let cy = ((u32::from(cp[0]) * 299 + u32::from(cp[1]) * 587 + u32::from(cp[2]) * 114 + 500)
+            / 1000) as u8;
+        orig_y.push(oy);
+        cand_y.push(cy);
+    }
+
+    let luma_ssim = compute_ssim(&orig_y, &cand_y, width, height, 1)?;
+    let channel_ssim = compute_ssim(orig, cand, width, height, channels)?;
+    // Blend 65% luminance perceptual SSIM + 35% full-channel SSIM (captures chroma & alpha)
+    Ok((0.65 * luma_ssim + 0.35 * channel_ssim).clamp(0.0, 1.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn accumulate_block<const CH: usize>(
+    orig: &[u8],
+    cand: &[u8],
+    row_stride: usize,
+    start_x: usize,
+    w_block: usize,
+    start_y: usize,
+    end_y: usize,
+    sum_x: &mut [u64; 4],
+    sum_y: &mut [u64; 4],
+    sum_xx: &mut [u64; 4],
+    sum_yy: &mut [u64; 4],
+    sum_xy: &mut [u64; 4],
+) {
+    for y in start_y..end_y {
+        let row_start = y * row_stride + start_x * CH;
+        let row_end = row_start + w_block * CH;
+        let orig_row = &orig[row_start..row_end];
+        let cand_row = &cand[row_start..row_end];
+        for (op, cp) in orig_row
+            .as_chunks::<CH>()
+            .0
+            .iter()
+            .zip(cand_row.as_chunks::<CH>().0.iter())
+        {
+            for ch in 0..CH {
+                let vx = u64::from(op[ch]);
+                let vy = u64::from(cp[ch]);
+                sum_x[ch] += vx;
+                sum_y[ch] += vy;
+                sum_xx[ch] += vx * vx;
+                sum_yy[ch] += vy * vy;
+                sum_xy[ch] += vx * vy;
+            }
+        }
+    }
 }
 
 fn validate_buffers(
@@ -420,5 +492,30 @@ mod tests {
         let cand = vec![0u8; 90];
         let res = compute_ssim(&orig, &cand, 10, 10, 1);
         assert!(matches!(res, Err(QualityError::InvalidBuffer { .. })));
+    }
+
+    #[test]
+    fn test_ssim_detects_alpha_degradation() {
+        // Identical black RGB pixels, shape encoded solely in alpha channel
+        let width = 16;
+        let height = 16;
+        let mut orig = vec![0u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = (y * width + x) * 4;
+                orig[idx + 3] = if (x + y) % 2 == 0 { 255 } else { 0 };
+            }
+        }
+        // Candidate wipes out alpha to fully opaque (all 255)
+        let mut bad_alpha = orig.clone();
+        for chunk in bad_alpha.as_chunks_mut::<4>().0 {
+            chunk[3] = 255;
+        }
+
+        let ssim = compute_ssim(&orig, &bad_alpha, width, height, 4).unwrap();
+        assert!(
+            ssim < 0.85,
+            "SSIM must detect destroyed alpha channel, got {ssim}"
+        );
     }
 }

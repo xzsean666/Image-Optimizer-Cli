@@ -48,4 +48,15 @@ mod tests {
     fn test_storage_feature_reexport() {
         assert_eq!(storage::VERSION, VERSION);
     }
+
+    #[test]
+    fn test_readme_batch_api_signature() {
+        let tasks = vec![BatchTask::new("nonexistent.png", ())];
+        let (results, summary) =
+            execute_batch_scoped(tasks, &BatchOptions::default(), |_path, ()| {
+                Ok::<_, ImgoptError>(())
+            });
+        assert_eq!(results.len(), 1);
+        assert_eq!(summary.succeeded, 1);
+    }
 }

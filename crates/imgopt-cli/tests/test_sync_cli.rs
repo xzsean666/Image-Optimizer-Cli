@@ -115,3 +115,29 @@ fn test_sync_cli_missing_storage_config_fails() {
 
     assert!(!status_bucket_only.success());
 }
+
+#[test]
+fn test_sync_cli_fail_on_error_exits_nonzero_on_partial_failure() {
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("inputs");
+    fs::create_dir_all(&input_dir).unwrap();
+    make_png_fixture(&input_dir.join("valid.png"));
+    fs::write(input_dir.join("broken.png"), b"\x89PNG\r\n\x1a\ncorrupt").unwrap();
+
+    let bin_path = env!("CARGO_BIN_EXE_imgopt");
+    let manifest_path = temp.path().join("manifest.json");
+
+    let status = Command::new(bin_path)
+        .args([
+            "sync",
+            input_dir.to_str().unwrap(),
+            "--dry-run",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--fail-on-error",
+        ])
+        .status()
+        .unwrap();
+
+    assert!(!status.success());
+}

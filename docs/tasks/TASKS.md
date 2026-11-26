@@ -91,8 +91,8 @@ The main dependency spine (branches converge before sync) is:
 ## V1 Completion Checklist
 
 - [x] Every task is `DONE` or has an explicit documented deferral.
-- [ ] `cargo fmt --check` passes (run in CI; install `rustfmt` locally if missing).
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes (run in CI; install `clippy` locally if missing).
+- [x] `cargo fmt --check` passes (run in CI; install `rustfmt` locally if missing).
+- [x] `cargo clippy --all-targets --all-features -- -D warnings` passes (run in CI; install `clippy` locally if missing).
 - [x] `cargo test --workspace` passes.
 - [x] Local optimize, sync, inspect, verify, and benchmark commands are covered.
 - [x] Duplicate, resume, partial failure, invalid image, and storage retry cases

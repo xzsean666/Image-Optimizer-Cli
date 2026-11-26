@@ -16,18 +16,27 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+avif-parse = "2.1"
 clap = { version = "4.5", features = ["derive"] }
+exoquant = "0.2"
+fast_image_resize = "6.2"
+globset = "0.4"
 hex = "0.4"
 hmac = "0.12"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+imgref = "1.12"
+jpeg-encoder = "0.7"
+oxipng = { version = "10.2", default-features = false, features = ["parallel"] }
+png = "0.18"
+qcms = "0.3"
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+ravif = { version = "0.13", default-features = false, features = ["threading"] }
+rgb = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3.17"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
 url = "2.5"
-webp = "0.3"
-oxipng = "10.2"
-jpeg-encoder = "0.7"
-
-
+webp = { version = "0.3", default-features = false }
+yuv = "0.8"

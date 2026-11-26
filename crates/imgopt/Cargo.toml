@@ -18,6 +18,3 @@ imgopt-core = { path = "../imgopt-core" }
 imgopt-manifest = { path = "../imgopt-manifest", optional = true }
 imgopt-quality = { path = "../imgopt-quality" }
 imgopt-storage = { path = "../imgopt-storage", optional = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

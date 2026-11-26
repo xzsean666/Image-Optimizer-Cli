@@ -18,23 +18,25 @@ pub use analyzer::{
     analyze_image, read_file_bounded, AnalysisResult, ImageCharacteristics, ResourceLimits,
 };
 pub use benchmark::{
-    run_benchmark, run_benchmark_with_concurrency, BenchmarkCaseResult, BenchmarkReport,
-    BenchmarkSummary,
+    run_benchmark, run_benchmark_with_concurrency, run_benchmark_with_options, BenchmarkCaseResult,
+    BenchmarkReport, BenchmarkSummary,
 };
 pub use candidate::{
     compare_candidates, select_best_candidate, OptimizationCandidate, RankingCriteria,
 };
-pub use config::{MetadataPolicy, OptimizationConfig, OptimizationPreset, OutputFormatPolicy};
+pub use config::{
+    MetadataPolicy, OptimizationConfig, OptimizationPreset, OutputFormatPolicy, ResizeMode,
+};
 pub use detect::{detect_format, detect_format_from_reader, MAX_HEADER_PROBE_BYTES};
 pub use error::{ErrorKind, ImgoptError, PipelineStage, Result, StorageErrorKind};
 pub use executor::{
     execute_batch, execute_batch_scoped, BatchItemResult, BatchOptions, BatchSummary, BatchTask,
-    ConcurrencyProbe,
+    ConcurrencyProbe, MemoryBudget, MemoryLease,
 };
 pub use hash::{hash_bytes, hash_file, hash_reader, Sha256Digest, HASH_BUFFER_SIZE};
 pub use model::{
-    unix_to_utc_components, utc_now_rfc3339, AssetId, ColorType, Dimensions, EncodedCandidate,
-    ImageFormat, ImageMetadata, ImageProfile, RawImage, SourceReference,
+    compute_byte_savings, unix_to_utc_components, utc_now_rfc3339, AssetId, ColorType, Dimensions,
+    EncodedCandidate, ImageFormat, ImageMetadata, ImageProfile, RawImage, SourceReference,
 };
 pub use optimization_key::{OptimizationKey, OPTIMIZATION_KEY_SCHEME_VERSION};
 pub use optimizer::{OptimizationResult, OptimizationService};

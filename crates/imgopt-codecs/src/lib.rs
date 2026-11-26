@@ -3,18 +3,27 @@ use std::io::Cursor;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
 
+pub mod avif;
+pub mod gif;
 pub mod interface;
 pub mod jpeg;
 pub mod png;
+pub mod transform;
 pub mod webp;
 
+pub use avif::AvifCodec;
+pub use gif::GifCodec;
 pub use interface::{
-    check_dimensions_against_limits, CodecCapabilities, CodecError, CodecFormat, DecodeLimits,
-    DecodedPixels, EncodeOptions, EncodedOutput, FakeCodec, ImageCodec, ImageMetadataChunks,
-    MetadataPreservation, PixelFormat,
+    check_dimensions_against_limits, AnimationFrame, CodecCapabilities, CodecError, CodecFormat,
+    DecodeLimits, DecodedAnimation, DecodedPixels, EncodeOptions, EncodedOutput, FakeCodec,
+    ImageCodec, ImageMetadataChunks, MetadataPreservation, PixelFormat,
 };
 pub use jpeg::JpegCodec;
 pub use png::PngCodec;
+pub use transform::{
+    compute_target_dimensions, convert_icc_to_srgb, decode_animation_with_limits,
+    encode_animated_gif, encode_animated_webp, resize_pixels, ResizeMode,
+};
 pub use webp::WebpCodec;
 
 /// Helper function to get default codec for a given format.
@@ -23,6 +32,8 @@ pub fn codec_for_format(format: CodecFormat) -> Box<dyn ImageCodec> {
         CodecFormat::Jpeg => Box::new(JpegCodec),
         CodecFormat::Png => Box::new(PngCodec),
         CodecFormat::Webp => Box::new(WebpCodec),
+        CodecFormat::Avif => Box::new(AvifCodec),
+        CodecFormat::Gif => Box::new(GifCodec),
     }
 }
 
@@ -52,14 +63,22 @@ fn finish_decode<D: ImageDecoder>(
         }
     }
 
-    let icc_profile = decoder.icc_profile().ok().flatten().filter(|b| !b.is_empty());
+    let icc_profile = decoder
+        .icc_profile()
+        .ok()
+        .flatten()
+        .filter(|b| !b.is_empty());
     let mut exif = decoder
         .exif_metadata()
         .ok()
         .flatten()
         .map(strip_exif_app1_prefix)
         .filter(|b| !b.is_empty());
-    let xmp = decoder.xmp_metadata().ok().flatten().filter(|b| !b.is_empty());
+    let xmp = decoder
+        .xmp_metadata()
+        .ok()
+        .flatten()
+        .filter(|b| !b.is_empty());
 
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
 
@@ -81,18 +100,21 @@ fn finish_decode<D: ImageDecoder>(
             image::ColorType::L8 => (PixelFormat::Grayscale8, img.into_luma8().into_raw()),
             _ => (PixelFormat::Rgb8, img.into_rgb8().into_raw()),
         },
-        CodecFormat::Png | CodecFormat::Webp => match img.color() {
-            image::ColorType::L8 | image::ColorType::L16 => {
-                (PixelFormat::Grayscale8, img.into_luma8().into_raw())
+        CodecFormat::Png | CodecFormat::Webp | CodecFormat::Avif | CodecFormat::Gif => {
+            match img.color() {
+                image::ColorType::L8 | image::ColorType::L16 => {
+                    (PixelFormat::Grayscale8, img.into_luma8().into_raw())
+                }
+                image::ColorType::La8 | image::ColorType::La16 => (
+                    PixelFormat::GrayscaleAlpha8,
+                    img.into_luma_alpha8().into_raw(),
+                ),
+                image::ColorType::Rgb8 | image::ColorType::Rgb16 => {
+                    (PixelFormat::Rgb8, img.into_rgb8().into_raw())
+                }
+                _ => (PixelFormat::Rgba8, img.into_rgba8().into_raw()),
             }
-            image::ColorType::La8 | image::ColorType::La16 => {
-                (PixelFormat::GrayscaleAlpha8, img.into_luma_alpha8().into_raw())
-            }
-            image::ColorType::Rgb8 | image::ColorType::Rgb16 => {
-                (PixelFormat::Rgb8, img.into_rgb8().into_raw())
-            }
-            _ => (PixelFormat::Rgba8, img.into_rgba8().into_raw()),
-        },
+        }
     };
 
     Ok(DecodedPixels::with_metadata(
