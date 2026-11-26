@@ -212,13 +212,29 @@ fn encode_quantized_indexed_png(
 
     let mut out = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, pixels.width, pixels.height);
-        encoder.set_color(png::ColorType::Indexed);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_palette(plte);
+        let mut info = png::Info::with_size(pixels.width, pixels.height);
+        info.color_type = png::ColorType::Indexed;
+        info.bit_depth = png::BitDepth::Eight;
+        info.palette = Some(std::borrow::Cow::Borrowed(&plte));
         if has_alpha {
-            encoder.set_trns(trns);
+            info.trns = Some(std::borrow::Cow::Borrowed(&trns));
         }
+        if preserve.preserve_icc {
+            if let Some(ref icc) = pixels.metadata.icc_profile {
+                if !icc.is_empty() {
+                    info.icc_profile = Some(std::borrow::Cow::Borrowed(icc));
+                }
+            }
+        }
+        if preserve.preserve_exif {
+            if let Some(ref exif) = pixels.metadata.exif {
+                if !exif.is_empty() {
+                    info.exif_metadata = Some(std::borrow::Cow::Borrowed(exif));
+                }
+            }
+        }
+        let encoder = png::Encoder::with_info(&mut out, info)
+            .map_err(|e| CodecError::EncodeError(format!("PNG indexed info error: {e}")))?;
         let mut writer = encoder
             .write_header()
             .map_err(|e| CodecError::EncodeError(format!("PNG indexed header error: {e}")))?;
@@ -227,30 +243,10 @@ fn encode_quantized_indexed_png(
             .map_err(|e| CodecError::EncodeError(format!("PNG indexed write error: {e}")))?;
     }
 
-    // Re-attach preserved ICC/EXIF/XMP via truecolor metadata path if needed
-    if preserve.any() {
-        let mut tmp_pixels = DecodedPixels::with_metadata(
-            pixels.width,
-            pixels.height,
-            pixels.pixel_format,
-            pixels.data.clone(),
-            pixels.metadata.clone(),
-        );
-        // Reuse PNG chunk injection for XMP; for ICC/EXIF if requested on quantized PNG,
-        // inject directly via oxipng/png chunks or fall back cleanly.
-        if preserve.preserve_xmp {
-            if let Some(ref xmp) = tmp_pixels.metadata.xmp.take() {
-                if !xmp.is_empty() {
-                    out = insert_png_xmp_itxt(out, xmp);
-                }
-            }
-        }
-        if preserve.preserve_icc || preserve.preserve_exif {
-            // When ICC or EXIF must be preserved with indexed PNG, encode truecolor with metadata if smaller isn't required
-            // or insert standard chunks. Using truecolor fallback when ICC/EXIF requested keeps chunk framing 100% compliant.
-            let tc = encode_truecolor_png(pixels, preserve)?;
-            if tc.len() <= out.len() {
-                out = tc;
+    if preserve.preserve_xmp {
+        if let Some(ref xmp) = pixels.metadata.xmp {
+            if !xmp.is_empty() {
+                out = insert_png_xmp_itxt(out, xmp);
             }
         }
     }
@@ -509,5 +505,56 @@ mod tests {
         let dec = codec.decode(&lossy.bytes).unwrap();
         assert_eq!(dec.width, w);
         assert_eq!(dec.height, h);
+    }
+
+    #[test]
+    fn test_png_lossy_quantized_preserves_metadata() {
+        let codec = PngCodec;
+        let w = 32;
+        let h = 32;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.push((x * 8) as u8);
+                rgba.push((y * 8) as u8);
+                rgba.push(((x + y) * 4) as u8);
+                rgba.push(200);
+            }
+        }
+        let icc = b"fake-quantized-icc".to_vec();
+        let exif = vec![
+            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let xmp = b"<x:xmpmeta/>".to_vec();
+        let pixels = DecodedPixels::with_metadata(
+            w,
+            h,
+            PixelFormat::Rgba8,
+            rgba,
+            ImageMetadataChunks {
+                icc_profile: Some(icc.clone()),
+                exif: Some(exif.clone()),
+                xmp: Some(xmp.clone()),
+            },
+        );
+        let lossy = codec
+            .encode(
+                &pixels,
+                &EncodeOptions {
+                    lossless: false,
+                    quality: 70,
+                    metadata_preservation: MetadataPreservation {
+                        preserve_exif: true,
+                        preserve_icc: true,
+                        preserve_xmp: true,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let dec = codec.decode(&lossy.bytes).unwrap();
+        assert_eq!(dec.metadata.icc_profile.as_deref(), Some(icc.as_slice()));
+        assert_eq!(dec.metadata.exif.as_deref(), Some(exif.as_slice()));
+        assert_eq!(dec.metadata.xmp.as_deref(), Some(xmp.as_slice()));
     }
 }

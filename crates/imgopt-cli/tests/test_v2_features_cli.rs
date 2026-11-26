@@ -259,3 +259,143 @@ fn test_gc_cli_lists_and_deletes_orphans_against_mock_s3() {
 
     server.join().unwrap();
 }
+
+#[test]
+fn test_sync_cli_variant_key_mode_and_urls_json() {
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("assets");
+    let nested = input_dir.join("banner");
+    fs::create_dir_all(&nested).unwrap();
+
+    make_png(&input_dir.join("logo.png"), 24, 24);
+    make_png(&nested.join("hero.png"), 32, 16);
+
+    let manifest_path = temp.path().join("manifest.json");
+    let urls_json_path = temp.path().join("urls.json");
+    let bin_path = env!("CARGO_BIN_EXE_imgopt");
+
+    let run1 = Command::new(bin_path)
+        .args([
+            "sync",
+            input_dir.to_str().unwrap(),
+            "--dry-run",
+            "--format",
+            "force-webp",
+            "--key-mode",
+            "variant",
+            "--preset",
+            "balanced",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--urls-json",
+            urls_json_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run1.stderr)
+    );
+
+    let urls1: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&urls_json_path).unwrap()).unwrap();
+    let logo_url_1 = urls1["logo.png"].as_str().unwrap().to_string();
+    let hero_url_1 = urls1["banner/hero.png"].as_str().unwrap().to_string();
+    assert!(logo_url_1.starts_with("https://dry-run.local/images/"));
+    assert!(logo_url_1.ends_with("/optimized.webp"));
+    // Variant mode includes a 12-hex-char config segment between sha256 and optimized.webp
+    let segments: Vec<&str> = logo_url_1
+        .trim_start_matches("https://dry-run.local/")
+        .split('/')
+        .collect();
+    assert_eq!(segments.len(), 4, "unexpected variant URL: {logo_url_1}");
+    assert_eq!(segments[2].len(), 12);
+
+    // Changing resize width under variant mode produces a brand-new immutable URL (no stale CDN collision)
+    let run2 = Command::new(bin_path)
+        .args([
+            "sync",
+            input_dir.to_str().unwrap(),
+            "--dry-run",
+            "--format",
+            "force-webp",
+            "--key-mode",
+            "variant",
+            "--resize-width",
+            "16",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--urls-json",
+            urls_json_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(run2.status.success());
+
+    let urls2: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&urls_json_path).unwrap()).unwrap();
+    let hero_url_2 = urls2["banner/hero.png"].as_str().unwrap().to_string();
+    assert_ne!(hero_url_1, hero_url_2);
+}
+
+#[test]
+fn test_gc_cli_refuses_empty_manifest_delete_by_default() {
+    let temp = TempDir::new().unwrap();
+    let manifest_path = temp.path().join("empty_manifest.json");
+    fs::write(
+        &manifest_path,
+        r#"{"schema_version":1,"optimizer_version":"0.1.0","created_at":"2026-08-17T00:00:00Z","updated_at":"2026-08-17T00:00:00Z","entries":{}}"#,
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <Name>test-bucket</Name>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>images/existing/optimized.webp</Key><Size>123</Size><ETag>"e1"</ETag></Contents>
+</ListBucketResult>"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+    });
+
+    let bin_path = env!("CARGO_BIN_EXE_imgopt");
+    let out = Command::new(bin_path)
+        .env("IMGOPT_S3_ACCESS_KEY_ID", "test-key")
+        .env("IMGOPT_S3_SECRET_ACCESS_KEY", "test-secret")
+        .args([
+            "gc",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--bucket",
+            "test-bucket",
+            "--endpoint",
+            &format!("http://{addr}"),
+            "--delete",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("allow-empty-manifest"));
+
+    server.join().unwrap();
+}

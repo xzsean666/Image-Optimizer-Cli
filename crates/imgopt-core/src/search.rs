@@ -293,6 +293,7 @@ pub(crate) fn search_best_candidate_with_limits(
                 && preservation.preserve_icc
                 && preservation.preserve_xmp,
             metadata_preservation: preservation,
+            max_threads: decode_limits.max_threads,
         };
         if let Some(cand) = evaluate_single_candidate(
             decoded_input,
@@ -321,6 +322,7 @@ pub(crate) fn search_best_candidate_with_limits(
                         && preservation.preserve_icc
                         && preservation.preserve_xmp,
                     metadata_preservation: preservation,
+                    max_threads: decode_limits.max_threads,
                 };
                 if let Some(cand) = evaluate_single_candidate(
                     decoded_input,
@@ -351,6 +353,7 @@ pub(crate) fn search_best_candidate_with_limits(
                         && preservation.preserve_icc
                         && preservation.preserve_xmp,
                     metadata_preservation: preservation,
+                    max_threads: decode_limits.max_threads,
                 };
 
                 if let Some(cand) = evaluate_single_candidate(

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -8,18 +8,19 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use imgopt_codecs::decode_animation_with_limits;
 use imgopt_core::{
-    analyze_image, compute_byte_savings, detect_format_from_reader, execute_batch_scoped,
-    hash_file, read_file_bounded, run_benchmark_with_options, scan_path, utc_now_rfc3339,
-    BatchOptions, BatchTask, Dimensions, ImageFormat, MetadataPolicy, OptimizationConfig,
-    OptimizationKey, OptimizationPreset, OptimizationService, OutputFormatPolicy, PipelineStage,
-    ResizeMode, ResourceLimits, ScanOptions, SyncItemStatus, SyncRunResult, SyncService,
+    analyze_image, compute_byte_savings, detect_format, execute_batch_scoped, hash_file,
+    read_file_bounded, run_benchmark_with_options, scan_path, utc_now_rfc3339, BatchOptions,
+    BatchTask, Dimensions, ImageFormat, MetadataPolicy, OptimizationConfig, OptimizationKey,
+    OptimizationPreset, OptimizationService, OutputFormatPolicy, PipelineStage, ResizeMode,
+    ResourceLimits, ScanOptions, SyncItemStatus, SyncRunResult, SyncService,
 };
 use imgopt_manifest::{
     EntryStatus, ManifestEntry, ManifestOptimizationRecord, ManifestSourceRecord, ManifestStore,
     ManifestSyncAdapter, RunItemStatus, RunResult, RunResultRecord,
 };
 use imgopt_storage::{
-    MemoryObjectStorage, ObjectStorage, RetryPolicy, S3Client, S3StorageConfig, StorageSyncAdapter,
+    retry_storage_op, MemoryObjectStorage, ObjectKeyMode, ObjectStorage, RetryPolicy, S3Client,
+    S3StorageConfig, StorageSyncAdapter,
 };
 
 const DEFAULT_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
@@ -270,6 +271,21 @@ struct OptimizeArgs {
     filter: FilterArgs,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyModeArg {
+    Content,
+    Variant,
+}
+
+impl From<KeyModeArg> for ObjectKeyMode {
+    fn from(m: KeyModeArg) -> Self {
+        match m {
+            KeyModeArg::Content => ObjectKeyMode::Content,
+            KeyModeArg::Variant => ObjectKeyMode::Variant,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 struct SyncArgs {
     /// Input directory or file to synchronize
@@ -283,9 +299,17 @@ struct SyncArgs {
     #[arg(long)]
     json: Option<PathBuf>,
 
+    /// Path to write a sorted relative-path -> remote URL mapping JSON
+    #[arg(long)]
+    urls_json: Option<PathBuf>,
+
     /// Output format policy (preserve, webp, avif, auto, jpeg, png, gif)
     #[arg(long, default_value = "webp")]
     format: String,
+
+    /// Object key derivation strategy (content = images/{sha}/optimized.{ext}, variant = images/{sha}/{opt_tag}/optimized.{ext})
+    #[arg(long, value_enum, default_value_t = KeyModeArg::Content)]
+    key_mode: KeyModeArg,
 
     /// Override S3 bucket name
     #[arg(long)]
@@ -432,6 +456,14 @@ struct GcArgs {
     /// Actually delete orphaned objects (default is safe dry-run)
     #[arg(long)]
     delete: bool,
+
+    /// Allow deleting remote objects even when the manifest has 0 active entries for the bucket
+    #[arg(long)]
+    allow_empty_manifest: bool,
+
+    /// Max concurrency for remote storage DELETE operations
+    #[arg(long)]
+    concurrency: Option<usize>,
 
     /// Path to write machine-readable GC report JSON
     #[arg(long)]
@@ -616,7 +648,6 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let config = build_optimization_config(&args.opt, &args.format)?;
     let version = env!("CARGO_PKG_VERSION");
-    let service = OptimizationService::new(version);
 
     let scan_opts = args.filter.to_scan_options();
     let scan_res = scan_path(&args.input, &scan_opts)?;
@@ -627,14 +658,18 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let is_single_file = scan_res.files.len() == 1 && args.input.is_file();
     let default_concurrency = BatchOptions::default().concurrency;
+    let concurrency = args
+        .filter
+        .concurrency
+        .unwrap_or(default_concurrency)
+        .max(1);
     let batch_opts = BatchOptions {
-        concurrency: args
-            .filter
-            .concurrency
-            .unwrap_or(default_concurrency)
-            .max(1),
+        concurrency,
         stop_on_error: false,
     };
+    let service = OptimizationService::new(version).with_codec_threads(Some(
+        OptimizationService::recommended_worker_codec_threads(concurrency),
+    ));
 
     let mut manifest_adapter = if let Some(ref m_path) = args.manifest {
         let store = ManifestStore::new(m_path);
@@ -677,7 +712,7 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref mut adapter) = manifest_adapter {
             if let Ok(digest) = hash_file(&file.path) {
                 let sha_hex = digest.to_hex();
-                let mut matched_skip: Option<(ImageFormat, u64, PathBuf)> = None;
+                let mut matched_skip: Option<(ImageFormat, u64, Option<f64>, PathBuf)> = None;
                 if let Some(entry) = adapter.manifest.get(&sha_hex) {
                     if let Some(ref opt) = entry.optimization {
                         let expected_key =
@@ -700,14 +735,18 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     )
                                 };
                                 if dest_path.exists() {
-                                    matched_skip =
-                                        Some((opt.output_format, opt.output_size, dest_path));
+                                    matched_skip = Some((
+                                        opt.output_format,
+                                        opt.output_size,
+                                        opt.quality_score,
+                                        dest_path,
+                                    ));
                                 }
                             }
                         }
                     }
                 }
-                if let Some((fmt, opt_bytes, dest_path)) = matched_skip {
+                if let Some((fmt, opt_bytes, q_score, dest_path)) = matched_skip {
                     adapter
                         .manifest
                         .add_path_alias(&sha_hex, file.path.to_string_lossy().into_owned());
@@ -729,7 +768,7 @@ fn run_optimize(args: OptimizeArgs) -> Result<(), Box<dyn std::error::Error>> {
                         source_bytes: file.byte_size,
                         optimized_bytes: Some(opt_bytes),
                         format: Some(fmt.to_string()),
-                        quality_score: None,
+                        quality_score: q_score,
                         remote_url: None,
                         error: None,
                     });
@@ -927,6 +966,7 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
         stop_on_error: false,
     };
 
+    let key_mode: ObjectKeyMode = args.key_mode.into();
     let sync_result: SyncRunResult = if args.dry_run {
         let bucket = args.bucket.unwrap_or_else(|| "dry-run-bucket".into());
         let storage = MemoryObjectStorage::new();
@@ -940,7 +980,8 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.prefix,
             RetryPolicy::default(),
         )
-        .with_cache_control(cache_control);
+        .with_cache_control(cache_control)
+        .with_key_mode(key_mode);
         let sync_service = SyncService::new(version, batch_options, &bucket);
         sync_service.run_sync_with_options(
             &args.input,
@@ -976,7 +1017,8 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
             key_prefix,
             RetryPolicy::default(),
         )
-        .with_cache_control(cache_control);
+        .with_cache_control(cache_control)
+        .with_key_mode(key_mode);
         let sync_service = SyncService::new(version, batch_options, &bucket);
         sync_service.run_sync_with_options(
             &args.input,
@@ -986,6 +1028,14 @@ fn run_sync(args: SyncArgs) -> Result<(), Box<dyn std::error::Error>> {
             &mut manifest_adapter,
         )?
     };
+
+    if let Some(ref urls_path) = args.urls_json {
+        let urls_map = build_sync_urls_map(&args.input, &sync_result);
+        write_atomically(
+            urls_path,
+            serde_json::to_string_pretty(&urls_map)?.as_bytes(),
+        )?;
+    }
 
     if let Some(ref json_path) = args.json {
         let records: Vec<RunResultRecord> = sync_result
@@ -1095,52 +1145,47 @@ fn run_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
         match bytes_res {
             Ok(bytes) => {
                 // Check for animated GIF/WebP/APNG first when inspecting
-                let mut fmt_opt = None;
-                if let Ok(file_handle) = fs::File::open(&file.path) {
-                    if let Ok(fmt) = detect_format_from_reader(file_handle) {
-                        fmt_opt = Some(fmt);
-                        if matches!(fmt, ImageFormat::Gif | ImageFormat::Webp | ImageFormat::Png) {
-                            if let Ok(Some(anim)) =
-                                decode_animation_with_limits(&bytes, fmt.into(), &decode_limits)
-                            {
-                                let dims = Dimensions::new(anim.width, anim.height);
-                                if args.json {
-                                    json_entries.push(serde_json::json!({
-                                        "path": file.path,
-                                        "format": fmt.as_str(),
-                                        "animated": true,
-                                        "frames": anim.frames.len(),
-                                        "dimensions": {
-                                            "width": dims.width,
-                                            "height": dims.height,
-                                            "pixel_count": dims.pixel_count(),
-                                        },
-                                        "color_type": "Rgba8",
-                                        "byte_size": bytes.len(),
-                                    }));
-                                } else {
-                                    println!("Image: {}", file.path.display());
-                                    println!(
-                                        "  Format:       {} (animated, {} frames)",
-                                        fmt,
-                                        anim.frames.len()
-                                    );
-                                    println!(
-                                        "  Dimensions:   {}x{} ({} pixels)",
-                                        dims.width,
-                                        dims.height,
-                                        dims.pixel_count()
-                                    );
-                                    println!("  Color:        Rgba8 (4 channels)");
-                                    println!("  Size:         {} bytes", bytes.len());
-                                    println!();
-                                }
-                                continue;
+                if let Ok(fmt) = detect_format(&bytes) {
+                    if matches!(fmt, ImageFormat::Gif | ImageFormat::Webp | ImageFormat::Png) {
+                        if let Ok(Some(anim)) =
+                            decode_animation_with_limits(&bytes, fmt.into(), &decode_limits)
+                        {
+                            let dims = Dimensions::new(anim.width, anim.height);
+                            if args.json {
+                                json_entries.push(serde_json::json!({
+                                    "path": file.path,
+                                    "format": fmt.as_str(),
+                                    "animated": true,
+                                    "frames": anim.frames.len(),
+                                    "dimensions": {
+                                        "width": dims.width,
+                                        "height": dims.height,
+                                        "pixel_count": dims.pixel_count(),
+                                    },
+                                    "color_type": "Rgba8",
+                                    "byte_size": bytes.len(),
+                                }));
+                            } else {
+                                println!("Image: {}", file.path.display());
+                                println!(
+                                    "  Format:       {} (animated, {} frames)",
+                                    fmt,
+                                    anim.frames.len()
+                                );
+                                println!(
+                                    "  Dimensions:   {}x{} ({} pixels)",
+                                    dims.width,
+                                    dims.height,
+                                    dims.pixel_count()
+                                );
+                                println!("  Color:        Rgba8 (4 channels)");
+                                println!("  Size:         {} bytes", bytes.len());
+                                println!();
                             }
+                            continue;
                         }
                     }
                 }
-                let _ = fmt_opt;
 
                 match analyze_image(&bytes, Some(&limits)) {
                     Ok(analysis) => {
@@ -1354,8 +1399,11 @@ fn run_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
             concurrency: args.concurrency.unwrap_or(8).max(1),
             stop_on_error: false,
         };
+        let retry_policy = RetryPolicy::default();
         let (results, _) = execute_batch_scoped(storage_checks, &batch_opts, |_, chk| {
-            let outcome = match client.head_object(&chk.bucket, &chk.object_key) {
+            let outcome = match retry_storage_op(&retry_policy, || {
+                client.head_object(&chk.bucket, &chk.object_key)
+            }) {
                 Ok(Some(meta)) => {
                     if meta.byte_size != chk.expected_size {
                         Err(format!(
@@ -1521,7 +1569,10 @@ fn run_gc(args: GcArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map(|st| st.object_key.clone())
         .collect();
 
-    let remote_objects = client.list_objects(&bucket, Some(&scan_prefix))?;
+    let retry_policy = RetryPolicy::default();
+    let remote_objects = retry_storage_op(&retry_policy, || {
+        client.list_objects(&bucket, Some(&scan_prefix))
+    })?;
     let mut orphan_keys = Vec::new();
     let mut orphan_bytes = 0u64;
 
@@ -1534,11 +1585,36 @@ fn run_gc(args: GcArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut deleted_keys = Vec::new();
     let mut delete_errors = Vec::new();
-    if args.delete {
-        for key in &orphan_keys {
-            match client.delete_object(&bucket, key) {
-                Ok(()) => deleted_keys.push(key.clone()),
-                Err(e) => delete_errors.push(format!("{key}: {e}")),
+    if args.delete && !orphan_keys.is_empty() {
+        if active_keys.is_empty() && !args.allow_empty_manifest {
+            return Err(format!(
+                "refusing to delete {} remote object(s) because manifest has 0 active entries for bucket '{bucket}'; pass --allow-empty-manifest to override",
+                orphan_keys.len()
+            )
+            .into());
+        }
+
+        let delete_tasks: Vec<BatchTask<String>> = orphan_keys
+            .iter()
+            .map(|k| BatchTask::new(k, k.clone()))
+            .collect();
+        let batch_opts = BatchOptions {
+            concurrency: args.concurrency.unwrap_or(8).max(1),
+            stop_on_error: false,
+        };
+        let (results, _) = execute_batch_scoped(delete_tasks, &batch_opts, |_, key| {
+            Ok(
+                retry_storage_op(&retry_policy, || client.delete_object(&bucket, &key))
+                    .map(|()| key.clone())
+                    .map_err(|e| format!("{key}: {e}")),
+            )
+        });
+
+        for res in results {
+            match res.output {
+                Ok(Ok(key)) => deleted_keys.push(key),
+                Ok(Err(err_msg)) => delete_errors.push(err_msg),
+                Err(e) => delete_errors.push(e.to_string()),
             }
         }
     }
@@ -1587,6 +1663,32 @@ fn run_gc(args: GcArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn build_sync_urls_map(input_root: &Path, sync_result: &SyncRunResult) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for item in &sync_result.items {
+        if !matches!(
+            item.status,
+            SyncItemStatus::Optimized | SyncItemStatus::Skipped
+        ) {
+            continue;
+        }
+        let Some(ref url) = item.remote_url else {
+            continue;
+        };
+        let rel = if input_root.is_dir() {
+            item.path.strip_prefix(input_root).unwrap_or(&item.path)
+        } else {
+            item.path
+                .file_name()
+                .map(Path::new)
+                .unwrap_or(item.path.as_path())
+        };
+        let normalized = rel.to_string_lossy().replace('\\', "/");
+        map.insert(normalized, url.clone());
+    }
+    map
 }
 
 fn write_atomically(target_path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {

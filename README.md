@@ -179,6 +179,12 @@ fn batch_example() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+#### 在 Web API 服务中集成（并发安全与直传 S3/R2）
+如果在 `axum` / `tokio` 等异步 Web 服务中引入 `imgopt`（建议开启 `features = ["storage"]`）：
+- **共享 `Arc<OptimizationService>`**：让内部的 `MemoryBudget`（默认 `1 GiB`）跨所有请求统一生效，防止并发大图解码触发 OOM。
+- **使用 `tokio::task::spawn_blocking`**：`OptimizationService` 与 `S3Client` 均为同步阻塞实现，请放入 `spawn_blocking` 执行，并配置 `.with_codec_threads(Some(1))` 或 `Some(2)` 避免单请求抢占全部 CPU。
+- **一步上传优化结果**：可通过 `StorageSyncAdapter::upload_optimization_result(&bucket, &opt_res)` 直接上传校验并获取 `public_url`。
+
 ---
 
 ## CLI 命令行使用指南
@@ -202,9 +208,16 @@ imgopt optimize ./photos --output ./dist --manifest .local-manifest.json --exclu
 # Dry-run 演练模式（无需真实 S3 凭证）
 imgopt sync ./photos --dry-run --manifest manifest.json --json result.json
 
-# 生产环境同步至 Cloudflare R2 / AWS S3（读取 .env 或 --env-file）
-imgopt --env-file .env.prod sync ./photos --format auto --resize-width 2048 --fail-on-error --json sync-report.json
+# 生产环境同步至 Cloudflare R2 / AWS S3（使用 variant 不可变键并导出相对路径 -> CDN URL 映射）
+imgopt --env-file .env.prod sync ./photos \
+  --format auto \
+  --key-mode variant \
+  --resize-width 2048 \
+  --urls-json urls.json \
+  --json sync-report.json \
+  --fail-on-error
 ```
+> 💡 **CI/CD 一键自动化模板**：如果你有一个专门存放素材的仓库，希望上传图片后由 GitHub Actions 自动优化同步到 R2/S3 并直接输出可复制的 CDN 链接，可参考即用模板 [`docs/examples/sync-r2-s3.yml`](docs/examples/sync-r2-s3.yml)。
 
 ### 3. 图像探查（`inspect`）
 只读分析格式（含动图与帧数）、分辨率、色彩通道、透明通道、灰度特征、信息熵及 EXIF/ICC/XMP 元数据：
@@ -226,9 +239,10 @@ imgopt verify --manifest manifest.json --check-storage --concurrency 16
 # 先预览将被清理的孤儿对象
 imgopt gc --manifest manifest.json --prefix assets
 
-# 确认无误后执行删除并输出 JSON 报告
-imgopt gc --manifest manifest.json --prefix assets --delete --json gc-report.json
+# 确认无误后并发执行删除并输出 JSON 报告
+imgopt gc --manifest manifest.json --prefix assets --concurrency 8 --delete --json gc-report.json
 ```
+> 注：为防止误指定空清单导致误删整桶对象，当清单中针对目标桶的活跃条目数为 `0` 时，`gc --delete` 默认会拒绝执行（除非显式传入 `--allow-empty-manifest`）。
 
 ### 6. 基准性能测试（`benchmark`）
 ```bash
@@ -260,14 +274,16 @@ imgopt benchmark ./dataset --preset maximum --format auto --json benchmark_repor
 | `--prefix` | `IMGOPT_S3_KEY_PREFIX` / `IMGOPT_S3_PREFIX` | — | 远程对象键前缀 |
 | `--public-url-base` | `IMGOPT_PUBLIC_URL_BASE` / `IMGOPT_S3_PUBLIC_URL_BASE` | — | 公开 CDN 基础域名 |
 | `--cache-control` | `IMGOPT_S3_CACHE_CONTROL` | `public, max-age=31536000, immutable` | 上传对象的 `Cache-Control` 响应头 |
+| `--key-mode` | — | `content` | `sync` 对象键模式：`content`（`images/{sha}/optimized.{ext}`）或 `variant`（含配置哈希，适配参数变更与 `immutable` 缓存） |
+| `--urls-json` | — | — | `sync` 导出的 `相对路径 -> CDN URL` 扁平映射 JSON 文件路径 |
 | `--preset` | — | `balanced` | 优化预设：`balanced`、`maximum`、`aggressive` |
 | `--quality` / `-q` | — | 随预设 | 目标 SSIM 画质分数（`0.0` ~ `1.0`） |
 | `--effort` / `-e` | — | 随预设 | 编码耗力级别（`1` ~ `6`） |
 | `--format` | — | `preserve`（`sync` 为 `webp`） | `preserve`、`webp`、`avif`、`auto`、`jpeg`、`png`、`gif`、`force-webp`、`force-avif` |
 | `--resize-width` / `--resize-height` | — | — | 目标缩放宽高（像素） |
 | `--resize-mode` | — | `scale-down` | 缩放模式：`scale-down`、`contain`、`cover`、`exact` |
-| `--preserve-metadata` | — | `false` | 保留全部 EXIF / ICC / XMP 元数据 |
-| `--preserve-icc` | — | `false` | 仅保留 ICC 色彩配置，剥离 EXIF / XMP |
+| `--preserve-metadata` | — | `false` | 保留全部 EXIF / ICC / XMP 元数据（注：AVIF 编码暂不写入容器元数据） |
+| `--preserve-icc` | — | `false` | 仅保留 ICC 色彩配置，剥离 EXIF / XMP 隐私数据（AVIF 暂不支持） |
 | `--no-srgb-convert` | — | `false` | 禁用剥离 ICC 时的自动 sRGB 转换 |
 | `--include` / `--exclude` | — | — | Glob 文件路径过滤（可多次指定） |
 | `--concurrency` | — | CPU 核数上限 16（`sync` 为 `4`） | 并发工作线程数 |

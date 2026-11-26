@@ -155,8 +155,8 @@ pub(crate) fn decode_with_image_reader(
                 image::codecs::png::PngDecoder::with_limits(Cursor::new(input_bytes), img_limits)
                     .map_err(|e| map_image_error(codec_format, e))?;
             if decoder.is_apng().unwrap_or(false) {
-                return Err(CodecError::UnsupportedFormat(
-                    "animated PNG (APNG) is not supported in V1".into(),
+                return Err(CodecError::AnimatedImage(
+                    "animated PNG (APNG) requires animation pipeline".into(),
                 ));
             }
             finish_decode(decoder, codec_format, limits)
@@ -168,8 +168,8 @@ pub(crate) fn decode_with_image_reader(
                 .set_limits(img_limits)
                 .map_err(|e| map_image_error(codec_format, e))?;
             if decoder.has_animation() {
-                return Err(CodecError::UnsupportedFormat(
-                    "animated WebP is not supported in V1".into(),
+                return Err(CodecError::AnimatedImage(
+                    "animated WebP requires animation pipeline".into(),
                 ));
             }
             finish_decode(decoder, codec_format, limits)
@@ -246,6 +246,6 @@ mod tests {
         let webp_mem = anim.encode();
 
         let err = WebpCodec.decode(&webp_mem).unwrap_err();
-        assert!(matches!(err, CodecError::UnsupportedFormat(_)));
+        assert!(matches!(err, CodecError::AnimatedImage(_)));
     }
 }

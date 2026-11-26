@@ -1,5 +1,17 @@
 use crate::interface::StorageError;
 
+/// Strategy for deriving remote object keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectKeyMode {
+    /// Content-addressed by source SHA-256 and output format:
+    /// `images/{source_sha256}/optimized.{format}`.
+    #[default]
+    Content,
+    /// Content- and config-addressed (safe for `Cache-Control: immutable` when resize/preset changes):
+    /// `images/{source_sha256}/{opt_hash_prefix}/optimized.{format}`.
+    Variant,
+}
+
 /// Derive a deterministic, path-independent object key in storage.
 ///
 /// Format: `images/{source_sha256}/optimized.{format}`
@@ -36,13 +48,7 @@ pub fn derive_object_key(source_sha256: &str, format: &str) -> Result<String, St
     Ok(format!("images/{clean_sha}/optimized.{clean_fmt}"))
 }
 
-/// Derive a deterministic object key with an optional prefix directory path.
-pub fn derive_object_key_with_prefix(
-    prefix: Option<&str>,
-    source_sha256: &str,
-    format: &str,
-) -> Result<String, StorageError> {
-    let base_key = derive_object_key(source_sha256, format)?;
+fn prepend_key_prefix(prefix: Option<&str>, base_key: String) -> Result<String, StorageError> {
     if let Some(p) = prefix {
         let clean_p = p.trim().trim_matches('/');
         if !clean_p.is_empty() {
@@ -59,6 +65,60 @@ pub fn derive_object_key_with_prefix(
         }
     }
     Ok(base_key)
+}
+
+/// Derive a short, URL-safe, deterministic 12-hex-char tag from an optimization key.
+fn short_variant_tag(optimization_key: &str) -> Result<String, StorageError> {
+    let trimmed = optimization_key.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::InvalidParameter(
+            "optimization_key cannot be empty".into(),
+        ));
+    }
+    if let Some(tail) = trimmed.rsplit('-').next() {
+        if tail.len() >= 12 && tail.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(tail[..12].to_ascii_lowercase());
+        }
+    }
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    let hex_digest = hex::encode(hasher.finalize());
+    Ok(hex_digest[..12].to_string())
+}
+
+/// Derive a deterministic object key with an optional prefix directory path.
+pub fn derive_object_key_with_prefix(
+    prefix: Option<&str>,
+    source_sha256: &str,
+    format: &str,
+) -> Result<String, StorageError> {
+    let base_key = derive_object_key(source_sha256, format)?;
+    prepend_key_prefix(prefix, base_key)
+}
+
+/// Derive a deterministic object key according to `ObjectKeyMode` and an optional prefix.
+pub fn derive_object_key_for_mode(
+    mode: ObjectKeyMode,
+    prefix: Option<&str>,
+    source_sha256: &str,
+    optimization_key: Option<&str>,
+    format: &str,
+) -> Result<String, StorageError> {
+    match mode {
+        ObjectKeyMode::Content => derive_object_key_with_prefix(prefix, source_sha256, format),
+        ObjectKeyMode::Variant => {
+            let opt_key = optimization_key.ok_or_else(|| {
+                StorageError::InvalidParameter(
+                    "optimization_key is required for ObjectKeyMode::Variant".into(),
+                )
+            })?;
+            let base_key = derive_object_key(source_sha256, format)?;
+            let tag = short_variant_tag(opt_key)?;
+            let variant_key = base_key.replacen("/optimized.", &format!("/{tag}/optimized."), 1);
+            prepend_key_prefix(prefix, variant_key)
+        }
+    }
 }
 
 /// Construct a safe public URL given a public base URL and an object key.
@@ -147,5 +207,39 @@ mod tests {
         assert!(build_public_url("ftp://not-http.com", "img.webp").is_err());
         assert!(build_public_url("https://cdn.example.com", "images/../../escape.webp").is_err());
         assert!(build_public_url("https://cdn.example.com", "images/a?foo=1").is_err());
+    }
+
+    #[test]
+    fn test_derive_object_key_variant_mode() {
+        let sha = "a1b2c3d4e5f6";
+        let opt_a = "opt-v1-webp-balanced-0123456789abcdef0123456789abcdef";
+        let opt_b = "opt-v1-webp-maximum-fedcba9876543210fedcba9876543210";
+
+        let key_a = derive_object_key_for_mode(
+            ObjectKeyMode::Variant,
+            Some("assets"),
+            sha,
+            Some(opt_a),
+            "webp",
+        )
+        .unwrap();
+        let key_b = derive_object_key_for_mode(
+            ObjectKeyMode::Variant,
+            Some("assets"),
+            sha,
+            Some(opt_b),
+            "webp",
+        )
+        .unwrap();
+
+        assert_eq!(
+            key_a,
+            "assets/images/a1b2c3d4e5f6/0123456789ab/optimized.webp"
+        );
+        assert_eq!(
+            key_b,
+            "assets/images/a1b2c3d4e5f6/fedcba987654/optimized.webp"
+        );
+        assert_ne!(key_a, key_b);
     }
 }

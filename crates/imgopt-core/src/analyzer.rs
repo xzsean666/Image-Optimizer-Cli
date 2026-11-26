@@ -37,6 +37,7 @@ impl ResourceLimits {
             max_height: self.max_height,
             max_pixels: Some(self.max_pixels),
             max_alloc_bytes,
+            max_threads: None,
         }
     }
 }
@@ -136,6 +137,10 @@ pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<An
                 PipelineStage::ResourceCheck,
                 ErrorKind::ResourceLimitExceeded(msg),
             ),
+            imgopt_codecs::CodecError::AnimatedImage(msg)
+            | imgopt_codecs::CodecError::UnsupportedFormat(msg) => {
+                ImgoptError::new(PipelineStage::Decode, ErrorKind::UnsupportedFormat(msg))
+            }
             other => ImgoptError::new(
                 PipelineStage::Decode,
                 ErrorKind::Decode(format!("failed to decode image during analysis: {other}")),

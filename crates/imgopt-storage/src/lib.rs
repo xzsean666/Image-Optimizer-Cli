@@ -12,8 +12,11 @@ pub use interface::{
     UploadResponse,
 };
 pub use s3::S3Client;
-pub use upload::{upload_and_verify, RetryPolicy, VerifiedUploadResult};
-pub use url::{build_public_url, derive_object_key};
+pub use upload::{retry_storage_op, upload_and_verify, RetryPolicy, VerifiedUploadResult};
+pub use url::{
+    build_public_url, derive_object_key, derive_object_key_for_mode, derive_object_key_with_prefix,
+    ObjectKeyMode,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -45,6 +45,36 @@ fn jitter_millis(max_jitter: u64) -> u64 {
     nanos % (max_jitter + 1)
 }
 
+/// Retry a storage operation on retryable errors with exponential backoff and jitter.
+pub fn retry_storage_op<T, F>(retry_policy: &RetryPolicy, mut op: F) -> Result<T, StorageError>
+where
+    F: FnMut() -> Result<T, StorageError>,
+{
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut backoff = retry_policy.initial_backoff_millis;
+    let mut last_error = StorageError::InvalidParameter("operation not attempted".into());
+
+    for attempt in 1..=max_attempts {
+        match op() {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                let is_retryable = e.is_retryable();
+                last_error = e;
+                if !is_retryable || attempt == max_attempts {
+                    return Err(last_error);
+                }
+            }
+        }
+
+        let jitter = jitter_millis(backoff / 4);
+        thread::sleep(Duration::from_millis(backoff.saturating_add(jitter)));
+        backoff = ((backoff as f64) * retry_policy.backoff_multiplier) as u64;
+        backoff = backoff.min(retry_policy.max_backoff_millis);
+    }
+
+    Err(last_error)
+}
+
 /// Upload an object with bounded retries and strict post-upload verification.
 pub fn upload_and_verify<S: ObjectStorage>(
     storage: &S,

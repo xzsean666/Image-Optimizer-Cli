@@ -1,11 +1,11 @@
 use imgopt_core::{
-    utc_now_rfc3339, ErrorKind, ImageFormat, ImgoptError, PipelineStage, Result as CoreResult,
-    StorageErrorKind, SyncStorage, SyncStorageOutput,
+    hash_bytes, utc_now_rfc3339, ErrorKind, ImageFormat, ImgoptError, OptimizationResult,
+    PipelineStage, Result as CoreResult, StorageErrorKind, SyncStorage, SyncStorageOutput,
 };
 
 use crate::interface::{ObjectStorage, StorageError, UploadRequest};
 use crate::upload::{upload_and_verify, RetryPolicy};
-use crate::url::{build_public_url, derive_object_key_with_prefix};
+use crate::url::{build_public_url, derive_object_key_for_mode, ObjectKeyMode};
 
 /// Type alias for dynamic presigned URL generator functions.
 pub type PresignedUrlGenerator = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
@@ -16,6 +16,8 @@ pub struct StorageSyncAdapter<S: ObjectStorage> {
     pub public_url_base: Option<String>,
     pub key_prefix: Option<String>,
     pub cache_control: Option<String>,
+    pub key_mode: ObjectKeyMode,
+    pub default_bucket: Option<String>,
     pub presigned_url_generator: Option<PresignedUrlGenerator>,
     pub retry_policy: RetryPolicy,
 }
@@ -32,6 +34,8 @@ impl<S: ObjectStorage> StorageSyncAdapter<S> {
             public_url_base,
             key_prefix,
             cache_control: None,
+            key_mode: ObjectKeyMode::Content,
+            default_bucket: None,
             presigned_url_generator: None,
             retry_policy,
         }
@@ -42,12 +46,46 @@ impl<S: ObjectStorage> StorageSyncAdapter<S> {
         self
     }
 
+    pub fn with_key_mode(mut self, key_mode: ObjectKeyMode) -> Self {
+        self.key_mode = key_mode;
+        self
+    }
+
+    pub fn with_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.default_bucket = Some(bucket.into());
+        self
+    }
+
     pub fn with_presigned_generator<F: Fn(&str, &str) -> Option<String> + Send + Sync + 'static>(
         mut self,
         gen: F,
     ) -> Self {
         self.presigned_url_generator = Some(Box::new(gen));
         self
+    }
+
+    /// Convenience helper for API/library callers: upload and verify a single `OptimizationResult`
+    /// using the adapter's configured key mode, prefix, cache-control, and public URL base.
+    pub fn upload_optimization_result(
+        &self,
+        bucket: &str,
+        result: &OptimizationResult,
+    ) -> CoreResult<SyncStorageOutput> {
+        let sha_hex = result.source_sha256.to_hex();
+        let object_key = self.derive_object_key_for_optimization(
+            &sha_hex,
+            result.optimization_key.as_str(),
+            result.effective_format,
+        )?;
+        let content_type = result.effective_format.mime_type();
+        let opt_sha = hash_bytes(&result.validated_output.bytes).to_hex();
+        self.upload_and_verify(
+            bucket,
+            &object_key,
+            &result.validated_output.bytes,
+            content_type,
+            Some(&opt_sha),
+        )
     }
 }
 
@@ -92,9 +130,32 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
     }
 
     fn derive_object_key(&self, source_sha256: &str, format: ImageFormat) -> CoreResult<String> {
-        derive_object_key_with_prefix(
+        derive_object_key_for_mode(
+            ObjectKeyMode::Content,
             self.key_prefix.as_deref(),
             source_sha256,
+            None,
+            format.extension(),
+        )
+        .map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::StorageUpload,
+                imgopt_core::ErrorKind::InvalidInput(e.to_string()),
+            )
+        })
+    }
+
+    fn derive_object_key_for_optimization(
+        &self,
+        source_sha256: &str,
+        optimization_key: &str,
+        format: ImageFormat,
+    ) -> CoreResult<String> {
+        derive_object_key_for_mode(
+            self.key_mode,
+            self.key_prefix.as_deref(),
+            source_sha256,
+            Some(optimization_key),
             format.extension(),
         )
         .map_err(|e| {
@@ -109,7 +170,7 @@ impl<S: ObjectStorage> SyncStorage for StorageSyncAdapter<S> {
         if let Some(ref base) = self.public_url_base {
             build_public_url(base, object_key).ok()
         } else if let Some(ref gen) = self.presigned_url_generator {
-            gen("", object_key)
+            gen(self.default_bucket.as_deref().unwrap_or(""), object_key)
         } else {
             None
         }
@@ -157,5 +218,30 @@ mod tests {
 
         let auth_err = map_storage_error(StorageError::AuthenticationFailed("bad key".into()));
         assert!(!auth_err.is_retryable());
+    }
+
+    #[test]
+    fn test_adapter_variant_key_mode() {
+        let storage = crate::interface::MemoryObjectStorage::new();
+        let adapter = StorageSyncAdapter::new(
+            storage,
+            Some("https://cdn.example.com".into()),
+            Some("blog".into()),
+            RetryPolicy::default(),
+        )
+        .with_key_mode(ObjectKeyMode::Variant);
+
+        let key = adapter
+            .derive_object_key_for_optimization(
+                "deadbeef",
+                "opt-v1-webp-balanced-1122334455667788",
+                ImageFormat::Webp,
+            )
+            .unwrap();
+        assert_eq!(key, "blog/images/deadbeef/112233445566/optimized.webp");
+        assert_eq!(
+            adapter.build_public_url(&key).as_deref(),
+            Some("https://cdn.example.com/blog/images/deadbeef/112233445566/optimized.webp")
+        );
     }
 }

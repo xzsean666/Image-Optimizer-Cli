@@ -3,7 +3,7 @@ name = "imgopt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Rust image optimization engine (JPEG, PNG, WebP) with SSIM/PSNR quality targets, manifest deduplication, and S3-compatible sync"
+description = "Rust image optimization engine (JPEG, PNG, WebP, AVIF, GIF) with SSIM/PSNR quality targets, manifest deduplication, and S3-compatible sync"
 repository = "https://github.com/xzsean666/Image-Optimizer-Cli"
 
 [features]

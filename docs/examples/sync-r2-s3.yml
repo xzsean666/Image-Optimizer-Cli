@@ -1,0 +1,82 @@
+# 示例：上传图片到 Git 仓库后自动优化同步至 Cloudflare R2 / AWS S3，并生成 CDN 链接清单
+# 复制此文件到你的素材仓库 `.github/workflows/sync-images.yml` 即可使用。
+#
+# 需要配置的 GitHub Repository Secrets：
+#   - IMGOPT_S3_ACCESS_KEY_ID      (R2/S3 Access Key ID)
+#   - IMGOPT_S3_SECRET_ACCESS_KEY  (R2/S3 Secret Access Key)
+#
+# 需要配置的 GitHub Repository Variables（或直接写死在 env 中）：
+#   - IMGOPT_S3_BUCKET             (存储桶名称)
+#   - IMGOPT_S3_ENDPOINT           (R2 填 https://<account_id>.r2.cloudflarestorage.com)
+#   - IMGOPT_S3_REGION             (R2 填 auto，AWS S3 填对应区域如 us-east-1)
+#   - IMGOPT_PUBLIC_URL_BASE       (CDN 公开访问域名，如 https://cdn.example.com)
+#   - IMGOPT_S3_KEY_PREFIX         (可选，建议按仓库隔离，如 my-assets)
+
+name: Optimize and Sync Images
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "images/**"
+      - ".github/workflows/sync-images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install imgopt CLI (prebuilt release)
+        run: |
+          TAG="v0.1.0"
+          curl -sSL "https://github.com/xzsean666/Image-Optimizer-Cli/releases/download/${TAG}/imgopt-linux-x86_64.tar.gz" -o imgopt.tar.gz
+          tar -xzf imgopt.tar.gz
+          chmod +x imgopt
+          sudo mv imgopt /usr/local/bin/imgopt
+          rm -f imgopt.tar.gz
+
+      - name: Optimize and sync images to S3 / R2
+        env:
+          IMGOPT_S3_BUCKET: ${{ vars.IMGOPT_S3_BUCKET }}
+          IMGOPT_S3_ENDPOINT: ${{ vars.IMGOPT_S3_ENDPOINT }}
+          IMGOPT_S3_REGION: ${{ vars.IMGOPT_S3_REGION || 'auto' }}
+          IMGOPT_PUBLIC_URL_BASE: ${{ vars.IMGOPT_PUBLIC_URL_BASE }}
+          IMGOPT_S3_KEY_PREFIX: ${{ vars.IMGOPT_S3_KEY_PREFIX || 'assets' }}
+          IMGOPT_S3_ACCESS_KEY_ID: ${{ secrets.IMGOPT_S3_ACCESS_KEY_ID }}
+          IMGOPT_S3_SECRET_ACCESS_KEY: ${{ secrets.IMGOPT_S3_SECRET_ACCESS_KEY }}
+        run: |
+          mkdir -p images
+          imgopt sync ./images \
+            --format auto \
+            --key-mode variant \
+            --manifest .imgopt-manifest.json \
+            --json sync-report.json \
+            --urls-json urls.json \
+            --fail-on-error
+
+      - name: Publish CDN URLs to GitHub Step Summary
+        if: always() && hashFiles('sync-report.json') != ''
+        run: |
+          {
+            echo "### Image Optimization & CDN Links"
+            echo ""
+            echo "| File | Status | Format | Original | Optimized | CDN URL |"
+            echo "|---|---|---|---|---|---|"
+            jq -r '.items[] | "| `\(.path)` | \(.status) | \(.format // "-") | \(.source_bytes) B | \(.optimized_bytes // "-") B | \(.remote_url // "-") |"' sync-report.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit updated manifest and urls.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .imgopt-manifest.json urls.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(images): update manifest and CDN URLs [skip ci]"
+            git push
+          fi

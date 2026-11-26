@@ -42,7 +42,7 @@ impl ImageCodec for GifCodec {
             .ok_or_else(|| CodecError::DecodeError("GIF contains zero frames".into()))?
             .map_err(|e| CodecError::DecodeError(format!("failed to decode GIF frame: {e}")))?;
         if frames_iter.next().is_some() {
-            return Err(CodecError::UnsupportedFormat(
+            return Err(CodecError::AnimatedImage(
                 "animated GIF contains multiple frames".into(),
             ));
         }

@@ -179,7 +179,8 @@ impl From<imgopt_codecs::CodecError> for ImgoptError {
             imgopt_codecs::CodecError::EncodeError(msg) => {
                 Self::new(PipelineStage::Encode, ErrorKind::Encode(msg))
             }
-            imgopt_codecs::CodecError::UnsupportedFormat(msg) => Self::new(
+            imgopt_codecs::CodecError::UnsupportedFormat(msg)
+            | imgopt_codecs::CodecError::AnimatedImage(msg) => Self::new(
                 PipelineStage::FormatDetection,
                 ErrorKind::UnsupportedFormat(msg),
             ),

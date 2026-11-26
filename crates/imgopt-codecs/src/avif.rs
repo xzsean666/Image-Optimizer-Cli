@@ -75,9 +75,14 @@ impl ImageCodec for AvifCodec {
             }
         }
 
-        let threads = std::thread::available_parallelism()
-            .map_or(2, |n| n.get())
-            .min(8);
+        let threads = limits
+            .max_threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(2, |n| n.get())
+                    .min(8)
+            })
+            .max(1);
         let mut decoder = Rav1dDecoder::new(threads)?;
         let color_pic = decoder.decode_av1(&avif.primary_item)?;
         let out_w = color_pic.p.w.max(0) as u32;
@@ -116,15 +121,19 @@ impl ImageCodec for AvifCodec {
         let quality = f32::from(options.quality.clamp(1, 100));
         let speed = map_effort_to_ravif_speed(options.effort);
 
+        let threads = options
+            .max_threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(2, |n| n.get())
+                    .min(4)
+            })
+            .max(1);
         let encoder = ravif::Encoder::new()
             .with_quality(quality)
             .with_alpha_quality(quality)
             .with_speed(speed)
-            .with_num_threads(Some(
-                std::thread::available_parallelism()
-                    .map_or(2, |n| n.get())
-                    .min(4),
-            ));
+            .with_num_threads(Some(threads));
 
         let encoded = match pixels.pixel_format {
             PixelFormat::Rgb8 => {

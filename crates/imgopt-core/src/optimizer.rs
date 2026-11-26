@@ -42,6 +42,7 @@ pub struct OptimizationResult {
 pub struct OptimizationService {
     optimizer_version: String,
     memory_budget: Arc<MemoryBudget>,
+    codec_threads: Option<usize>,
 }
 
 impl OptimizationService {
@@ -49,12 +50,24 @@ impl OptimizationService {
         Self {
             optimizer_version: optimizer_version.into(),
             memory_budget: Arc::new(MemoryBudget::new(DEFAULT_MEMORY_BUDGET_BYTES)),
+            codec_threads: None,
         }
     }
 
     pub fn with_memory_budget(mut self, max_inflight_bytes: u64) -> Self {
         self.memory_budget = Arc::new(MemoryBudget::new(max_inflight_bytes));
         self
+    }
+
+    /// Limit per-codec internal thread count (useful when running inside a multi-worker batch pool).
+    pub fn with_codec_threads(mut self, max_threads: Option<usize>) -> Self {
+        self.codec_threads = max_threads.map(|n| n.max(1));
+        self
+    }
+
+    pub fn recommended_worker_codec_threads(concurrency: usize) -> usize {
+        let avail = std::thread::available_parallelism().map_or(4, |n| n.get());
+        (avail / concurrency.max(1)).clamp(1, 4)
     }
 
     pub fn optimizer_version(&self) -> &str {
@@ -91,17 +104,14 @@ impl OptimizationService {
             max_width: config.max_width,
             max_height: config.max_height,
         };
-        let decode_limits = limits.to_decode_limits();
+        let mut decode_limits = limits.to_decode_limits();
+        decode_limits.max_threads = self.codec_threads;
 
         // Check for animated multi-frame images (GIF, animated WebP, APNG) only when needed
         let analysis = match analyze_image(bytes, Some(&limits)) {
             Ok(a) => a,
             Err(err) => {
-                let is_animated_err = matches!(
-                    &err.kind,
-                    ErrorKind::Decode(msg) if msg.contains("animated") || msg.contains("APNG")
-                );
-                if is_animated_err {
+                if matches!(&err.kind, ErrorKind::UnsupportedFormat(_)) {
                     if let Ok(source_fmt) = detect_format(bytes) {
                         if let Some(anim) =
                             decode_animation_with_limits(bytes, source_fmt.into(), &decode_limits)
@@ -245,8 +255,8 @@ impl OptimizationService {
                 ImageFormat::Gif => (80, 80, 1),
                 ImageFormat::Avif => match config.preset {
                     OptimizationPreset::Maximum => (70, 98, 1),
-                    OptimizationPreset::Balanced => (50, 95, 2),
-                    OptimizationPreset::Aggressive => (35, 90, 2),
+                    OptimizationPreset::Balanced => (50, 95, 1),
+                    OptimizationPreset::Aggressive => (35, 90, 1),
                 },
                 ImageFormat::Jpeg | ImageFormat::Webp => match config.preset {
                     OptimizationPreset::Maximum => (70, 100, 1),
@@ -388,6 +398,13 @@ impl OptimizationService {
         config: &OptimizationConfig,
         limits: &ResourceLimits,
     ) -> Result<OptimizationResult> {
+        let estimated_mem = u64::from(anim.width)
+            .saturating_mul(u64::from(anim.height))
+            .saturating_mul(4)
+            .saturating_mul((anim.frames.len() as u64).max(1))
+            .max(1024);
+        let _mem_lease = self.memory_budget.acquire(estimated_mem);
+
         let orig_dims = Dimensions::new(anim.width, anim.height);
         let (target_w, target_h) = compute_target_dimensions(
             anim.width,
@@ -450,6 +467,7 @@ impl OptimizationService {
             lossless: config.quality_target >= 0.995,
             preserve_metadata: false,
             metadata_preservation: Default::default(),
+            max_threads: self.codec_threads,
         };
 
         let encoded_bytes = match target_anim_format {
@@ -464,19 +482,51 @@ impl OptimizationService {
             OutputFormatPolicy::Force(f) => f == source_fmt,
             _ => true,
         };
-        let (final_fmt, final_bytes) =
-            if !resized && source_allowed && (encoded_bytes.len() as u64) >= orig_len {
-                (source_fmt, orig_bytes.to_vec())
-            } else {
-                (target_anim_format, encoded_bytes)
-            };
+        let source_meta = crate::analyzer::probe_metadata_markers(orig_bytes, source_fmt);
+        let source_has_ancillary = has_ancillary_metadata(orig_bytes, source_fmt);
+        let can_keep_original = !resized
+            && source_allowed
+            && (encoded_bytes.len() as u64) >= orig_len
+            && source_satisfies_metadata_policy(
+                &source_meta,
+                source_has_ancillary,
+                config.metadata_policy,
+            );
 
-        let decode_limits = limits.to_decode_limits();
-        let _ = decode_animation_with_limits(
+        let (final_fmt, final_bytes) = if can_keep_original {
+            (source_fmt, orig_bytes.to_vec())
+        } else {
+            (target_anim_format, encoded_bytes)
+        };
+
+        let mut decode_limits = limits.to_decode_limits();
+        decode_limits.max_threads = self.codec_threads;
+        let verified_anim = decode_animation_with_limits(
             &final_bytes,
             CodecFormat::from(final_fmt),
             &decode_limits,
-        );
+        )
+        .map_err(|e| {
+            ImgoptError::new(
+                PipelineStage::OutputValidation,
+                ErrorKind::Decode(format!("corrupt animated output failed validation: {e}")),
+            )
+        })?
+        .ok_or_else(|| {
+            ImgoptError::new(
+                PipelineStage::OutputValidation,
+                ErrorKind::InvalidInput("animated output did not decode as an animation".into()),
+            )
+        })?;
+        if verified_anim.width != anim.width || verified_anim.height != anim.height {
+            return Err(ImgoptError::new(
+                PipelineStage::OutputValidation,
+                ErrorKind::InvalidInput(format!(
+                    "animated output dimensions {}x{} do not match expected {}x{}",
+                    verified_anim.width, verified_anim.height, anim.width, anim.height
+                )),
+            ));
+        }
 
         let (savings_bytes, savings_ratio) =
             crate::model::compute_byte_savings(orig_len, final_bytes.len() as u64);

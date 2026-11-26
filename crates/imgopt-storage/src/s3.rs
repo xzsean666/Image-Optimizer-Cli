@@ -637,11 +637,40 @@ impl ObjectStorage for S3Client {
 }
 
 fn unescape_xml(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.find(';') {
+            let entity = &after[..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if entity.starts_with('#') => {
+                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
@@ -945,5 +974,9 @@ mod tests {
         assert_eq!(items[0].byte_size, 1234);
         assert_eq!(items[0].etag.as_deref(), Some("etag1"));
         assert_eq!(items[1].object_key, "images/sha2/optimized.avif");
+
+        let xml_entities = r#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a&#39;b&#x20;c&amp;d.webp</Key><Size>10</Size></Contents></ListBucketResult>"#;
+        let (ent_items, _) = parse_list_objects_v2_xml(xml_entities);
+        assert_eq!(ent_items[0].object_key, "a'b c&d.webp");
     }
 }

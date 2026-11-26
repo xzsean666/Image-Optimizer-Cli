@@ -47,6 +47,14 @@ pub trait SyncStorage: Send + Sync {
     ) -> Result<SyncStorageOutput>;
 
     fn derive_object_key(&self, source_sha256: &str, format: ImageFormat) -> Result<String>;
+    fn derive_object_key_for_optimization(
+        &self,
+        source_sha256: &str,
+        _optimization_key: &str,
+        format: ImageFormat,
+    ) -> Result<String> {
+        self.derive_object_key(source_sha256, format)
+    }
     fn build_public_url(&self, object_key: &str) -> Option<String>;
 }
 
@@ -270,8 +278,11 @@ impl SyncService {
         batch_options: BatchOptions,
         bucket: impl Into<String>,
     ) -> Self {
+        let codec_threads =
+            OptimizationService::recommended_worker_codec_threads(batch_options.concurrency);
         Self {
-            optimizer: OptimizationService::new(optimizer_version),
+            optimizer: OptimizationService::new(optimizer_version)
+                .with_codec_threads(Some(codec_threads)),
             batch_options,
             bucket: bucket.into(),
         }
@@ -415,8 +426,11 @@ impl SyncService {
                 expected_format,
                 config,
             );
-            let expected_obj_key = storage.derive_object_key(&sha_str, expected_format).ok();
+            let expected_obj_key = storage
+                .derive_object_key_for_optimization(&sha_str, opt_key.as_str(), expected_format)
+                .ok();
 
+            let mut matched_opt_key = opt_key.clone();
             let mut action = manifest.evaluate_for_target(
                 &sha_str,
                 opt_key.as_str(),
@@ -441,7 +455,9 @@ impl SyncService {
                     alt_fmt,
                     config,
                 );
-                let alt_obj_key = storage.derive_object_key(&sha_str, alt_fmt).ok();
+                let alt_obj_key = storage
+                    .derive_object_key_for_optimization(&sha_str, alt_opt_key.as_str(), alt_fmt)
+                    .ok();
                 let alt_action = manifest.evaluate_for_target(
                     &sha_str,
                     alt_opt_key.as_str(),
@@ -449,6 +465,7 @@ impl SyncService {
                     alt_obj_key.as_deref(),
                 );
                 if matches!(alt_action, SyncPlanAction::SkipUpToDate { .. }) {
+                    matched_opt_key = alt_opt_key;
                     action = alt_action;
                     break;
                 }
@@ -465,7 +482,11 @@ impl SyncService {
                     skipped_count += 1;
                     total_optimized += optimized_bytes;
                     let resolved_url = storage
-                        .derive_object_key(&sha_str, format)
+                        .derive_object_key_for_optimization(
+                            &sha_str,
+                            matched_opt_key.as_str(),
+                            format,
+                        )
                         .ok()
                         .and_then(|k| storage.build_public_url(&k))
                         .or(storage_url);
@@ -529,8 +550,11 @@ impl SyncService {
 
                     let work_res: Result<(OptimizationResult, SyncStorageOutput)> = (|| {
                         let opt_res = self.optimizer.optimize_file(&path, config)?;
-                        let object_key =
-                            storage.derive_object_key(&sha_hex, opt_res.effective_format)?;
+                        let object_key = storage.derive_object_key_for_optimization(
+                            &sha_hex,
+                            opt_res.optimization_key.as_str(),
+                            opt_res.effective_format,
+                        )?;
                         let content_type = opt_res.effective_format.mime_type();
                         let opt_sha = hash_bytes(&opt_res.validated_output.bytes).to_hex();
                         let storage_out = storage.upload_and_verify(

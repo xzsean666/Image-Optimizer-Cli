@@ -61,6 +61,7 @@ pub enum CodecError {
     DecodeError(String),
     EncodeError(String),
     UnsupportedFormat(String),
+    AnimatedImage(String),
     InvalidParameter(String),
     ResourceLimitExceeded(String),
     Io(String),
@@ -72,6 +73,7 @@ impl fmt::Display for CodecError {
             Self::DecodeError(msg) => write!(f, "decode error: {msg}"),
             Self::EncodeError(msg) => write!(f, "encode error: {msg}"),
             Self::UnsupportedFormat(msg) => write!(f, "unsupported format: {msg}"),
+            Self::AnimatedImage(msg) => write!(f, "animated image: {msg}"),
             Self::InvalidParameter(msg) => write!(f, "invalid parameter: {msg}"),
             Self::ResourceLimitExceeded(msg) => write!(f, "resource limit exceeded: {msg}"),
             Self::Io(msg) => write!(f, "I/O error: {msg}"),
@@ -88,6 +90,7 @@ pub struct DecodeLimits {
     pub max_height: Option<u32>,
     pub max_pixels: Option<u64>,
     pub max_alloc_bytes: Option<u64>,
+    pub max_threads: Option<usize>,
 }
 
 impl Default for DecodeLimits {
@@ -97,6 +100,7 @@ impl Default for DecodeLimits {
             max_height: Some(16_384),
             max_pixels: Some(64 * 1024 * 1024),
             max_alloc_bytes: Some(512 * 1024 * 1024),
+            max_threads: None,
         }
     }
 }
@@ -210,6 +214,7 @@ pub struct EncodeOptions {
     pub lossless: bool,
     pub preserve_metadata: bool,
     pub metadata_preservation: MetadataPreservation,
+    pub max_threads: Option<usize>,
 }
 
 impl Default for EncodeOptions {
@@ -220,6 +225,7 @@ impl Default for EncodeOptions {
             lossless: false,
             preserve_metadata: false,
             metadata_preservation: MetadataPreservation::default(),
+            max_threads: None,
         }
     }
 }

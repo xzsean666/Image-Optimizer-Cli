@@ -78,7 +78,8 @@ pub fn run_benchmark_with_options(
     config.validate()?;
 
     let version = env!("CARGO_PKG_VERSION");
-    let service = OptimizationService::new(version);
+    let codec_threads = OptimizationService::recommended_worker_codec_threads(concurrency);
+    let service = OptimizationService::new(version).with_codec_threads(Some(codec_threads));
 
     let scan_res = scan_path(dataset_path, scan_options)?;
     let tasks: Vec<BatchTask<u64>> = scan_res

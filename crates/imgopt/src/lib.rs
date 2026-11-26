@@ -49,6 +49,38 @@ mod tests {
         assert_eq!(storage::VERSION, VERSION);
     }
 
+    #[cfg(feature = "storage")]
+    #[test]
+    fn test_api_optimize_and_upload_helper() {
+        let codec = codecs::PngCodec;
+        let pixels =
+            codecs::DecodedPixels::new(8, 8, codecs::PixelFormat::Rgb8, vec![120; 8 * 8 * 3]);
+        let encoded = codec
+            .encode(&pixels, &codecs::EncodeOptions::default())
+            .unwrap();
+
+        let service = OptimizationService::new(VERSION);
+        let config = OptimizationConfig::from_preset(OptimizationPreset::Balanced);
+        let opt_res = service.optimize_bytes(&encoded.bytes, &config).unwrap();
+
+        let mem_storage = storage::MemoryObjectStorage::new();
+        let adapter = storage::StorageSyncAdapter::new(
+            mem_storage,
+            Some("https://cdn.example.com".into()),
+            Some("uploads".into()),
+            storage::RetryPolicy::default(),
+        )
+        .with_key_mode(storage::ObjectKeyMode::Variant);
+
+        let uploaded = adapter
+            .upload_optimization_result("my-bucket", &opt_res)
+            .unwrap();
+        assert!(uploaded
+            .public_url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("https://cdn.example.com/uploads/images/")));
+    }
+
     #[test]
     fn test_readme_batch_api_signature() {
         let tasks = vec![BatchTask::new("nonexistent.png", ())];

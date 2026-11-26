@@ -163,19 +163,17 @@ pub fn convert_icc_to_srgb(pixels: &DecodedPixels) -> DecodedPixels {
     out
 }
 
-/// Decode an animated GIF, animated WebP, or APNG into RGBA8 frames with memory bounds.
+/// Decode an animated GIF, animated WebP, or APNG into RGBA8 frames with streaming per-frame memory bounds.
 pub fn decode_animation_with_limits(
     bytes: &[u8],
     format: CodecFormat,
     limits: &DecodeLimits,
 ) -> Result<Option<DecodedAnimation>, CodecError> {
-    let frames: Vec<Frame> = match format {
+    match format {
         CodecFormat::Gif => {
             let dec = GifDecoder::new(Cursor::new(bytes))
                 .map_err(|e| CodecError::DecodeError(format!("failed to decode GIF: {e}")))?;
-            dec.into_frames()
-                .collect_frames()
-                .map_err(|e| CodecError::DecodeError(format!("failed to decode GIF frames: {e}")))?
+            collect_animation_frames(dec.into_frames(), "GIF", limits)
         }
         CodecFormat::Webp => {
             let dec = WebPDecoder::new(Cursor::new(bytes))
@@ -183,9 +181,7 @@ pub fn decode_animation_with_limits(
             if !dec.has_animation() {
                 return Ok(None);
             }
-            dec.into_frames().collect_frames().map_err(|e| {
-                CodecError::DecodeError(format!("failed to decode animated WebP frames: {e}"))
-            })?
+            collect_animation_frames(dec.into_frames(), "animated WebP", limits)
         }
         CodecFormat::Png => {
             let dec = PngDecoder::new(Cursor::new(bytes))
@@ -196,47 +192,65 @@ pub fn decode_animation_with_limits(
             let apng = dec
                 .apng()
                 .map_err(|e| CodecError::DecodeError(format!("failed to open APNG: {e}")))?;
-            apng.into_frames().collect_frames().map_err(|e| {
-                CodecError::DecodeError(format!("failed to decode APNG frames: {e}"))
-            })?
+            collect_animation_frames(apng.into_frames(), "APNG", limits)
         }
-        _ => return Ok(None),
-    };
-
-    if frames.len() <= 1 {
-        return Ok(None);
+        _ => Ok(None),
     }
+}
 
-    let first_buf = frames[0].buffer();
-    let width = first_buf.width();
-    let height = first_buf.height();
-    check_dimensions_against_limits(width, height, limits)?;
+fn collect_animation_frames<'a>(
+    frames: image::Frames<'a>,
+    label: &str,
+    limits: &DecodeLimits,
+) -> Result<Option<DecodedAnimation>, CodecError> {
+    let mut out_frames = Vec::new();
+    let mut canvas_dims: Option<(u32, u32)> = None;
+    let mut total_alloc = 0u64;
 
-    if let Some(max_alloc) = limits.max_alloc_bytes {
-        let total_alloc = u64::from(width)
-            .saturating_mul(u64::from(height))
-            .saturating_mul(4)
-            .saturating_mul(frames.len() as u64);
-        if total_alloc > max_alloc {
-            return Err(CodecError::ResourceLimitExceeded(format!(
-                "animation frames total {total_alloc} bytes exceed limit of {max_alloc} bytes"
+    for frame_res in frames {
+        let f = frame_res.map_err(|e| {
+            CodecError::DecodeError(format!("failed to decode {label} frames: {e}"))
+        })?;
+        let buf = f.buffer();
+        let fw = buf.width();
+        let fh = buf.height();
+        check_dimensions_against_limits(fw, fh, limits)?;
+
+        let (cw, ch) = *canvas_dims.get_or_insert((fw, fh));
+        if fw != cw || fh != ch {
+            return Err(CodecError::DecodeError(format!(
+                "{label} frame dimensions {fw}x{fh} do not match canvas {cw}x{ch}"
             )));
         }
-    }
 
-    let mut out_frames = Vec::with_capacity(frames.len());
-    for f in frames {
+        let frame_bytes = u64::from(fw)
+            .saturating_mul(u64::from(fh))
+            .saturating_mul(4);
+        total_alloc = total_alloc.saturating_add(frame_bytes);
+        if let Some(max_alloc) = limits.max_alloc_bytes {
+            if total_alloc > max_alloc {
+                return Err(CodecError::ResourceLimitExceeded(format!(
+                    "animation frames total {total_alloc} bytes exceed limit of {max_alloc} bytes"
+                )));
+            }
+        }
+
         let (num, den) = f.delay().numer_denom_ms();
         let delay_millis = num.checked_div(den).map_or(100, |d| d.max(10));
         let rgba = f.into_buffer().into_raw();
         out_frames.push(AnimationFrame {
-            width,
-            height,
+            width: fw,
+            height: fh,
             rgba,
             delay_millis,
         });
     }
 
+    if out_frames.len() <= 1 {
+        return Ok(None);
+    }
+
+    let (width, height) = canvas_dims.unwrap_or((0, 0));
     Ok(Some(DecodedAnimation {
         width,
         height,
@@ -254,6 +268,11 @@ pub fn encode_animated_webp(
             "cannot encode animation with 0 frames".into(),
         ));
     }
+    if anim.width == 0 || anim.height == 0 {
+        return Err(CodecError::InvalidParameter(
+            "animation dimensions must be greater than 0".into(),
+        ));
+    }
     let mut config = webp::WebPConfig::new().map_err(|()| {
         CodecError::EncodeError("failed to initialize animated WebP config".into())
     })?;
@@ -264,6 +283,20 @@ pub fn encode_animated_webp(
     let mut encoder = webp::AnimEncoder::new(anim.width, anim.height, &config);
     let mut timestamp_ms: i32 = 0;
     for frame in &anim.frames {
+        let expected_len = (frame.width as usize)
+            .checked_mul(frame.height as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| {
+                CodecError::InvalidParameter("animation frame dimensions overflow".into())
+            })?;
+        if frame.width != anim.width
+            || frame.height != anim.height
+            || frame.rgba.len() != expected_len
+        {
+            return Err(CodecError::InvalidParameter(
+                "invalid animation frame dimensions or RGBA buffer length".into(),
+            ));
+        }
         encoder.add_frame(webp::AnimFrame::from_rgba(
             &frame.rgba,
             frame.width,
@@ -395,5 +428,34 @@ mod tests {
         let pixels = DecodedPixels::new(4, 4, PixelFormat::Rgb8, vec![100; 48]);
         let converted = convert_icc_to_srgb(&pixels);
         assert_eq!(converted.data, pixels.data);
+    }
+
+    #[test]
+    fn test_animation_decode_enforces_streaming_alloc_limit() {
+        let anim = DecodedAnimation {
+            width: 16,
+            height: 16,
+            frames: vec![
+                AnimationFrame {
+                    width: 16,
+                    height: 16,
+                    rgba: [255, 0, 0, 255].repeat(256),
+                    delay_millis: 40,
+                },
+                AnimationFrame {
+                    width: 16,
+                    height: 16,
+                    rgba: [0, 255, 0, 255].repeat(256),
+                    delay_millis: 40,
+                },
+            ],
+        };
+        let gif_bytes = encode_animated_gif(&anim, &EncodeOptions::default()).unwrap();
+        let tight = DecodeLimits {
+            max_alloc_bytes: Some(1500), // 1 frame = 1024 B ok, 2nd frame = 2048 B exceeds
+            ..Default::default()
+        };
+        let err = decode_animation_with_limits(&gif_bytes, CodecFormat::Gif, &tight).unwrap_err();
+        assert!(matches!(err, CodecError::ResourceLimitExceeded(_)));
     }
 }
