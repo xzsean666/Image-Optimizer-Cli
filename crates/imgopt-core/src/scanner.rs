@@ -334,7 +334,7 @@ fn open_scanned_file(path: &Path, follow_symlinks: bool) -> std::io::Result<File
         }
     }
     let file = opts.open(path)?;
-    if let Some(sym_meta) = pre_meta {
+    if let Some(_sym_meta) = pre_meta {
         let opened_meta = file.metadata()?;
         if !opened_meta.is_file() {
             return Err(std::io::Error::new(
@@ -345,7 +345,7 @@ fn open_scanned_file(path: &Path, follow_symlinks: bool) -> std::io::Result<File
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if sym_meta.dev() != opened_meta.dev() || sym_meta.ino() != opened_meta.ino() {
+            if _sym_meta.dev() != opened_meta.dev() || _sym_meta.ino() != opened_meta.ino() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "file changed or replaced during open",

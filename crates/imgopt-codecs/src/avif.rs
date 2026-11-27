@@ -1,22 +1,39 @@
+#[cfg(feature = "avif-decode")]
 use std::io::Cursor;
+#[cfg(feature = "avif-decode")]
 use std::mem::MaybeUninit;
+#[cfg(feature = "avif-decode")]
 use std::ptr::{self, NonNull};
 
-use imgref::{Img, ImgRef};
+#[cfg(feature = "avif-encode")]
+use imgref::Img;
+#[cfg(feature = "avif-decode")]
+use imgref::ImgRef;
+#[cfg(feature = "avif-decode")]
 use rav1d::include::dav1d::data::Dav1dData;
+#[cfg(feature = "avif-decode")]
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
+#[cfg(feature = "avif-decode")]
 use rav1d::include::dav1d::headers::*;
+#[cfg(feature = "avif-decode")]
 use rav1d::include::dav1d::picture::Dav1dPicture;
+#[cfg(feature = "avif-decode")]
 use rav1d::src::lib::{
     dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings, dav1d_get_picture,
     dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
+#[cfg(feature = "avif-encode")]
 use rgb::{RGB8, RGBA8};
+#[cfg(feature = "avif-decode")]
 use yuv::{YuvPlanarImage, YuvRange, YuvStandardMatrix};
 
+#[cfg(feature = "avif-decode")]
+use crate::interface::check_dimensions_against_limits;
+#[cfg(feature = "avif-encode")]
+use crate::interface::PixelFormat;
 use crate::interface::{
-    check_dimensions_against_limits, CodecCapabilities, CodecError, CodecFormat, DecodeLimits,
-    DecodedPixels, EncodeOptions, EncodedOutput, ImageCodec, PixelFormat,
+    CodecCapabilities, CodecError, CodecFormat, DecodeLimits, DecodedPixels, EncodeOptions,
+    EncodedOutput, ImageCodec,
 };
 
 /// Codec adapter for AVIF image encoding (via `ravif`) and decoding (via `avif-parse` + pure-Rust `rav1d`).
@@ -28,8 +45,8 @@ impl ImageCodec for AvifCodec {
         CodecCapabilities {
             format: CodecFormat::Avif,
             supports_lossless: false,
-            supports_lossy: true,
-            supports_alpha: true,
+            supports_lossy: cfg!(feature = "avif-encode"),
+            supports_alpha: cfg!(feature = "avif-encode"),
         }
     }
 
@@ -37,6 +54,7 @@ impl ImageCodec for AvifCodec {
         self.decode_with_limits(input_bytes, &DecodeLimits::default())
     }
 
+    #[cfg(feature = "avif-decode")]
     fn decode_with_limits(
         &self,
         input_bytes: &[u8],
@@ -78,9 +96,13 @@ impl ImageCodec for AvifCodec {
         let threads = limits
             .max_threads
             .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(2, |n| n.get())
-                    .min(8)
+                if cfg!(target_arch = "wasm32") || !cfg!(feature = "parallel") {
+                    1
+                } else {
+                    std::thread::available_parallelism()
+                        .map_or(2, |n| n.get())
+                        .min(8)
+                }
             })
             .max(1);
         let mut decoder = Rav1dDecoder::new(threads)?;
@@ -105,6 +127,18 @@ impl ImageCodec for AvifCodec {
         Ok(DecodedPixels::new(out_w, out_h, pixel_format, pixel_data))
     }
 
+    #[cfg(not(feature = "avif-decode"))]
+    fn decode_with_limits(
+        &self,
+        _input_bytes: &[u8],
+        _limits: &DecodeLimits,
+    ) -> Result<DecodedPixels, CodecError> {
+        Err(CodecError::UnsupportedFormat(
+            "AVIF decoding requires the `avif-decode` feature".into(),
+        ))
+    }
+
+    #[cfg(feature = "avif-encode")]
     fn encode(
         &self,
         pixels: &DecodedPixels,
@@ -124,9 +158,13 @@ impl ImageCodec for AvifCodec {
         let threads = options
             .max_threads
             .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(2, |n| n.get())
-                    .min(4)
+                if cfg!(target_arch = "wasm32") || !cfg!(feature = "parallel") {
+                    1
+                } else {
+                    std::thread::available_parallelism()
+                        .map_or(2, |n| n.get())
+                        .min(4)
+                }
             })
             .max(1);
         let encoder = ravif::Encoder::new()
@@ -197,8 +235,20 @@ impl ImageCodec for AvifCodec {
             effective_options: options.clone(),
         })
     }
+
+    #[cfg(not(feature = "avif-encode"))]
+    fn encode(
+        &self,
+        _pixels: &DecodedPixels,
+        _options: &EncodeOptions,
+    ) -> Result<EncodedOutput, CodecError> {
+        Err(CodecError::UnsupportedFormat(
+            "AVIF encoding requires the `avif-encode` feature".into(),
+        ))
+    }
 }
 
+#[cfg(feature = "avif-encode")]
 fn map_effort_to_ravif_speed(effort: u8) -> u8 {
     match effort.clamp(1, 6) {
         1 => 10,
@@ -210,10 +260,12 @@ fn map_effort_to_ravif_speed(effort: u8) -> u8 {
     }
 }
 
+#[cfg(feature = "avif-decode")]
 struct Rav1dDecoder {
     ctx: Option<Dav1dContext>,
 }
 
+#[cfg(feature = "avif-decode")]
 impl Rav1dDecoder {
     fn new(threads: usize) -> Result<Self, CodecError> {
         unsafe {
@@ -293,14 +345,17 @@ impl Rav1dDecoder {
     }
 }
 
+#[cfg(feature = "avif-decode")]
 impl Drop for Rav1dDecoder {
     fn drop(&mut self) {
         unsafe { dav1d_close(Some(NonNull::from(&mut self.ctx))) };
     }
 }
 
+#[cfg(feature = "avif-decode")]
 struct OwnedDav1dPicture(Dav1dPicture);
 
+#[cfg(feature = "avif-decode")]
 impl std::ops::Deref for OwnedDav1dPicture {
     type Target = Dav1dPicture;
     fn deref(&self) -> &Self::Target {
@@ -308,12 +363,14 @@ impl std::ops::Deref for OwnedDav1dPicture {
     }
 }
 
+#[cfg(feature = "avif-decode")]
 impl Drop for OwnedDav1dPicture {
     fn drop(&mut self) {
         unsafe { dav1d_picture_unref(Some(NonNull::from(&mut self.0))) };
     }
 }
 
+#[cfg(feature = "avif-decode")]
 unsafe fn plane_slice<'a, T: Copy>(
     pic: &'a Dav1dPicture,
     plane_idx: usize,
@@ -352,6 +409,7 @@ unsafe fn plane_slice<'a, T: Copy>(
     Ok(ImgRef::new_stride(buf, w, h, stride))
 }
 
+#[cfg(feature = "avif-decode")]
 fn rav1d_range(pic: &Dav1dPicture) -> YuvRange {
     let seq = pic.seq_hdr.map(|p| unsafe { p.as_ref() });
     if seq.is_some_and(|s| s.color_range != 0) {
@@ -361,6 +419,7 @@ fn rav1d_range(pic: &Dav1dPicture) -> YuvRange {
     }
 }
 
+#[cfg(feature = "avif-decode")]
 fn rav1d_matrix(pic: &Dav1dPicture) -> Result<YuvStandardMatrix, CodecError> {
     let seq = pic.seq_hdr.map(|p| unsafe { p.as_ref() });
     match seq.map(|s| s.mtrx).unwrap_or(DAV1D_MC_BT601) {
@@ -373,6 +432,7 @@ fn rav1d_matrix(pic: &Dav1dPicture) -> Result<YuvStandardMatrix, CodecError> {
     }
 }
 
+#[cfg(feature = "avif-decode")]
 fn scale_luma_to_u8(val: u16, bits: u32, range: YuvRange) -> u8 {
     let (min, span) = match range {
         YuvRange::Full => (0u32, (1u32 << bits) - 1),
@@ -382,6 +442,7 @@ fn scale_luma_to_u8(val: u16, bits: u32, range: YuvRange) -> u8 {
     ((clamped * 255 + span / 2) / span) as u8
 }
 
+#[cfg(feature = "avif-decode")]
 fn convert_rav1d_picture_to_8bit(
     pic: &Dav1dPicture,
     has_alpha: bool,
@@ -568,6 +629,7 @@ fn convert_rav1d_picture_to_8bit(
     ))
 }
 
+#[cfg(feature = "avif-decode")]
 fn apply_alpha_plane(
     alpha_pic: &Dav1dPicture,
     expected_w: u32,
@@ -618,6 +680,7 @@ fn apply_alpha_plane(
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "avif-encode", feature = "avif-decode"))]
     #[test]
     fn test_avif_encode_and_decode_roundtrip_rgb_and_rgba() {
         let codec = AvifCodec;

@@ -4,18 +4,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["parallel", "webp", "avif"]
+parallel = ["oxipng/parallel", "ravif?/threading"]
+webp = ["dep:webp"]
+avif = ["avif-encode", "avif-decode"]
+avif-encode = ["dep:ravif", "dep:imgref", "dep:rgb"]
+avif-decode = ["dep:rav1d", "dep:avif-parse", "dep:yuv", "dep:imgref"]
+
 [dependencies]
-avif-parse = { workspace = true }
+avif-parse = { workspace = true, optional = true }
 exoquant = { workspace = true }
 fast_image_resize = { workspace = true }
 image = { workspace = true }
-imgref = { workspace = true }
+imgref = { workspace = true, optional = true }
 jpeg-encoder = { workspace = true }
 oxipng = { workspace = true }
 png = { workspace = true }
 qcms = { workspace = true }
-rav1d = { workspace = true }
-ravif = { workspace = true }
-rgb = { workspace = true }
-webp = { workspace = true }
-yuv = { workspace = true }
+rav1d = { workspace = true, optional = true }
+ravif = { workspace = true, optional = true }
+rgb = { workspace = true, optional = true }
+webp = { workspace = true, optional = true }
+yuv = { workspace = true, optional = true }

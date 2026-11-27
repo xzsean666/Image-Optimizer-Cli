@@ -2,13 +2,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use imgopt_codecs::{
-    compute_target_dimensions, convert_icc_to_srgb, decode_animation_with_limits,
-    encode_animated_gif, encode_animated_webp, resize_pixels, CodecFormat, DecodedAnimation,
-    DecodedPixels, EncodeOptions,
+    compute_target_dimensions, convert_icc_to_srgb_with_status, decode_animation_with_limits,
+    encode_animated_gif, encode_animated_webp, probe_dimensions, resize_pixels, CodecFormat,
+    DecodedAnimation, DecodedPixels, EncodeOptions,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::analyzer::{analyze_image, has_ancillary_metadata, read_file_bounded, ResourceLimits};
+use crate::analyzer::{
+    analyze_image_with_decode_limits, has_ancillary_metadata, probe_metadata_markers,
+    read_file_bounded, ResourceLimits,
+};
 use crate::candidate::{compare_candidates, OptimizationCandidate, RankingCriteria};
 use crate::config::{MetadataPolicy, OptimizationConfig, OptimizationPreset, OutputFormatPolicy};
 use crate::detect::detect_format;
@@ -66,6 +69,9 @@ impl OptimizationService {
     }
 
     pub fn recommended_worker_codec_threads(concurrency: usize) -> usize {
+        if cfg!(target_arch = "wasm32") || !cfg!(feature = "parallel") {
+            return 1;
+        }
         let avail = std::thread::available_parallelism().map_or(4, |n| n.get());
         (avail / concurrency.max(1)).clamp(1, 4)
     }
@@ -96,6 +102,17 @@ impl OptimizationService {
     ) -> Result<OptimizationResult> {
         config.validate()?;
 
+        if (bytes.len() as u64) > config.max_input_bytes {
+            return Err(ImgoptError::new(
+                PipelineStage::ResourceCheck,
+                ErrorKind::ResourceLimitExceeded(format!(
+                    "input size {} bytes exceeds configured limit of {} bytes",
+                    bytes.len(),
+                    config.max_input_bytes
+                )),
+            ));
+        }
+
         let source_sha256 = hash_bytes(bytes);
 
         let limits = ResourceLimits {
@@ -105,16 +122,36 @@ impl OptimizationService {
             max_height: config.max_height,
         };
         let mut decode_limits = limits.to_decode_limits();
-        decode_limits.max_threads = self.codec_threads;
+        let effective_threads = self.codec_threads.or(if cfg!(target_arch = "wasm32") {
+            Some(1)
+        } else {
+            None
+        });
+        decode_limits.max_threads = effective_threads;
+
+        // Reserve decode + search scratch memory *before* decoding pixels using fast header probe
+        let probed_fmt = detect_format(bytes)?;
+        let pre_estimated_mem = match probe_dimensions(bytes, probed_fmt.into()) {
+            Ok((w, h)) => u64::from(w)
+                .saturating_mul(u64::from(h))
+                .saturating_mul(4)
+                .saturating_mul(2)
+                .min(limits.max_pixels.saturating_mul(8))
+                .max(1024),
+            Err(_) => (bytes.len() as u64)
+                .saturating_mul(8)
+                .clamp(1024, limits.max_pixels.saturating_mul(4).max(1024)),
+        };
+        let mut mem_lease = Some(self.memory_budget.acquire(pre_estimated_mem));
 
         // Check for animated multi-frame images (GIF, animated WebP, APNG) only when needed
-        let analysis = match analyze_image(bytes, Some(&limits)) {
-            Ok(a) => a,
-            Err(err) => {
-                if matches!(&err.kind, ErrorKind::UnsupportedFormat(_)) {
-                    if let Ok(source_fmt) = detect_format(bytes) {
+        let analysis =
+            match analyze_image_with_decode_limits(bytes, Some(&limits), effective_threads) {
+                Ok(a) => a,
+                Err(err) => {
+                    if matches!(&err.kind, ErrorKind::UnsupportedFormat(_)) {
                         if let Some(anim) =
-                            decode_animation_with_limits(bytes, source_fmt.into(), &decode_limits)
+                            decode_animation_with_limits(bytes, probed_fmt.into(), &decode_limits)
                                 .map_err(|e| match e {
                                 imgopt_codecs::CodecError::ResourceLimitExceeded(msg) => {
                                     ImgoptError::new(
@@ -130,25 +167,89 @@ impl OptimizationService {
                                 ),
                             })?
                         {
+                            drop(mem_lease.take());
                             return self.optimize_animation(
                                 bytes,
                                 &source_sha256,
-                                source_fmt,
+                                probed_fmt,
                                 anim,
                                 config,
                                 &limits,
                             );
                         }
                     }
+                    return Err(err);
                 }
-                return Err(err);
-            }
-        };
+            };
         let source_has_ancillary = has_ancillary_metadata(bytes, analysis.profile.format);
         let profile = analysis.profile;
+        let decoded_input: DecodedPixels = analysis.raw_image.into();
 
-        // Reserve estimated decoded + search scratch memory under the shared memory budget
-        let estimated_mem = profile
+        let result = self.optimize_decoded_internal(
+            bytes,
+            &source_sha256,
+            profile,
+            source_has_ancillary,
+            decoded_input,
+            config,
+            &limits,
+            &decode_limits,
+        );
+        drop(mem_lease);
+        result
+    }
+
+    /// Optimize pre-decoded pixels (for example when an external/browser decoder decoded AVIF)
+    /// while preserving content hashing, no-bloat fallback, resize, ICC->sRGB, and SSIM search.
+    pub fn optimize_raw_pixels(
+        &self,
+        source_bytes: &[u8],
+        raw_image: crate::model::RawImage,
+        source_format: ImageFormat,
+        config: &OptimizationConfig,
+    ) -> Result<OptimizationResult> {
+        config.validate()?;
+        if !raw_image.is_valid() {
+            return Err(ImgoptError::new(
+                PipelineStage::Decode,
+                ErrorKind::InvalidInput("raw image buffer length does not match dimensions".into()),
+            ));
+        }
+        if (source_bytes.len() as u64) > config.max_input_bytes {
+            return Err(ImgoptError::new(
+                PipelineStage::ResourceCheck,
+                ErrorKind::ResourceLimitExceeded(format!(
+                    "input size {} bytes exceeds configured limit of {} bytes",
+                    source_bytes.len(),
+                    config.max_input_bytes
+                )),
+            ));
+        }
+        let limits = ResourceLimits {
+            max_input_bytes: config.max_input_bytes,
+            max_pixels: config.max_pixels,
+            max_width: config.max_width,
+            max_height: config.max_height,
+        };
+        if raw_image.dimensions.pixel_count() > limits.max_pixels {
+            return Err(ImgoptError::new(
+                PipelineStage::ResourceCheck,
+                ErrorKind::ResourceLimitExceeded(format!(
+                    "pixel count {} exceeds configured limit of {}",
+                    raw_image.dimensions.pixel_count(),
+                    limits.max_pixels
+                )),
+            ));
+        }
+
+        let mut decode_limits = limits.to_decode_limits();
+        decode_limits.max_threads = self.codec_threads.or(if cfg!(target_arch = "wasm32") {
+            Some(1)
+        } else {
+            None
+        });
+
+        let estimated_mem = raw_image
             .dimensions
             .pixel_count()
             .saturating_mul(4)
@@ -156,7 +257,51 @@ impl OptimizationService {
             .max(1024);
         let _mem_lease = self.memory_budget.acquire(estimated_mem);
 
-        let mut decoded_input: DecodedPixels = analysis.raw_image.into();
+        let source_sha256 = hash_bytes(source_bytes);
+        let mut metadata = probe_metadata_markers(source_bytes, source_format);
+        if raw_image.metadata.exif.is_some() {
+            metadata.has_exif = true;
+        }
+        if raw_image.metadata.icc_profile.is_some() {
+            metadata.has_icc = true;
+        }
+        if raw_image.metadata.xmp.is_some() {
+            metadata.has_xmp = true;
+        }
+        let profile = ImageProfile {
+            format: source_format,
+            dimensions: raw_image.dimensions,
+            color_type: raw_image.color_type,
+            byte_size: source_bytes.len() as u64,
+            metadata,
+        };
+        let source_has_ancillary = has_ancillary_metadata(source_bytes, source_format);
+        let decoded_input: DecodedPixels = raw_image.into();
+
+        self.optimize_decoded_internal(
+            source_bytes,
+            &source_sha256,
+            profile,
+            source_has_ancillary,
+            decoded_input,
+            config,
+            &limits,
+            &decode_limits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn optimize_decoded_internal(
+        &self,
+        bytes: &[u8],
+        source_sha256: &Sha256Digest,
+        profile: ImageProfile,
+        source_has_ancillary: bool,
+        mut decoded_input: DecodedPixels,
+        config: &OptimizationConfig,
+        limits: &ResourceLimits,
+        decode_limits: &imgopt_codecs::DecodeLimits,
+    ) -> Result<OptimizationResult> {
         let mut transform_changed_pixels = false;
 
         // Apply optional resizing before candidate search so SSIM & validation compare against resized reference
@@ -185,39 +330,40 @@ impl OptimizationService {
             && config.convert_to_srgb
             && decoded_input.metadata.icc_profile.is_some()
         {
-            let before_ptr = decoded_input.metadata.icc_profile.clone();
-            let converted = convert_icc_to_srgb(&decoded_input);
-            if converted.data != decoded_input.data || before_ptr != converted.metadata.icc_profile
-            {
+            let (converted, changed) = convert_icc_to_srgb_with_status(&decoded_input);
+            if changed {
                 decoded_input = converted;
                 transform_changed_pixels = true;
             }
         }
-
         let expected_dimensions = Dimensions::new(decoded_input.width, decoded_input.height);
 
         let target_formats: Vec<ImageFormat> = match config.output_format_policy {
             OutputFormatPolicy::PreserveOriginal => vec![profile.format],
             OutputFormatPolicy::AllowWebp => {
-                if profile.format == ImageFormat::Webp {
-                    vec![ImageFormat::Webp]
+                if profile.format == ImageFormat::Webp || !cfg!(feature = "webp") {
+                    vec![profile.format]
                 } else {
                     vec![profile.format, ImageFormat::Webp]
                 }
             }
             OutputFormatPolicy::AllowAvif => {
-                if profile.format == ImageFormat::Avif {
-                    vec![ImageFormat::Avif]
+                if profile.format == ImageFormat::Avif
+                    || !cfg!(all(feature = "avif-encode", feature = "avif-decode"))
+                {
+                    vec![profile.format]
                 } else {
                     vec![profile.format, ImageFormat::Avif]
                 }
             }
             OutputFormatPolicy::Auto => {
                 let mut fmts = vec![profile.format];
-                if !fmts.contains(&ImageFormat::Webp) {
+                if cfg!(feature = "webp") && !fmts.contains(&ImageFormat::Webp) {
                     fmts.push(ImageFormat::Webp);
                 }
-                if !fmts.contains(&ImageFormat::Avif) {
+                if cfg!(all(feature = "avif-encode", feature = "avif-decode"))
+                    && !fmts.contains(&ImageFormat::Avif)
+                {
                     fmts.push(ImageFormat::Avif);
                 }
                 fmts
@@ -281,7 +427,7 @@ impl OptimizationService {
                 &decoded_input,
                 codec.as_ref(),
                 &search_opts,
-                &decode_limits,
+                decode_limits,
                 false,
             ) {
                 Ok(search_res) => {
@@ -367,17 +513,17 @@ impl OptimizationService {
         };
 
         let validated_output =
-            validate_predecoded_output(chosen_bytes, orig_bytes_len, &val_criteria, Some(&limits))?;
+            validate_predecoded_output(chosen_bytes, orig_bytes_len, &val_criteria, Some(limits))?;
 
         let optimization_key = OptimizationKey::compute(
-            &source_sha256,
+            source_sha256,
             &self.optimizer_version,
             chosen_format,
             config,
         );
 
         Ok(OptimizationResult {
-            source_sha256,
+            source_sha256: *source_sha256,
             optimization_key,
             profile,
             validated_output,
@@ -440,9 +586,14 @@ impl OptimizationService {
         }
 
         let target_anim_format = match config.output_format_policy {
-            OutputFormatPolicy::Force(ImageFormat::Webp)
-            | OutputFormatPolicy::AllowWebp
-            | OutputFormatPolicy::Auto => ImageFormat::Webp,
+            OutputFormatPolicy::Force(ImageFormat::Webp) => ImageFormat::Webp,
+            OutputFormatPolicy::AllowWebp | OutputFormatPolicy::Auto => {
+                if cfg!(feature = "webp") {
+                    ImageFormat::Webp
+                } else {
+                    ImageFormat::Gif
+                }
+            }
             OutputFormatPolicy::Force(ImageFormat::Gif) => ImageFormat::Gif,
             OutputFormatPolicy::PreserveOriginal | OutputFormatPolicy::AllowAvif => {
                 if source_fmt == ImageFormat::Webp {
@@ -581,8 +732,10 @@ fn source_satisfies_metadata_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "webp")]
+    use imgopt_codecs::WebpCodec;
     use imgopt_codecs::{
-        DecodedPixels, EncodeOptions, ImageCodec, JpegCodec, PixelFormat, PngCodec, WebpCodec,
+        DecodedPixels, EncodeOptions, ImageCodec, JpegCodec, PixelFormat, PngCodec,
     };
 
     fn make_test_jpeg() -> Vec<u8> {
@@ -603,6 +756,7 @@ mod tests {
             .bytes
     }
 
+    #[cfg(feature = "webp")]
     fn make_test_webp() -> Vec<u8> {
         let codec = WebpCodec;
         let pixels = DecodedPixels::new(8, 8, PixelFormat::Rgb8, vec![140; 8 * 8 * 3]);
@@ -638,6 +792,7 @@ mod tests {
         assert!(result.validated_output.byte_size <= bytes.len() as u64);
     }
 
+    #[cfg(feature = "webp")]
     #[test]
     fn test_optimize_service_webp() {
         let service = OptimizationService::new("0.1.0");
@@ -781,12 +936,17 @@ mod tests {
             .unwrap()
             .bytes;
 
-        let mut cfg = OptimizationConfig::from_preset(OptimizationPreset::Balanced);
-        cfg.resize_width = Some(16);
-        cfg.output_format_policy = OutputFormatPolicy::Force(ImageFormat::Avif);
-        let res = service.optimize_bytes(&png_bytes, &cfg).unwrap();
-        assert_eq!(res.effective_format, ImageFormat::Avif);
-        assert_eq!(res.validated_output.dimensions, Dimensions::new(16, 8));
+        #[cfg(all(feature = "avif-encode", feature = "avif-decode"))]
+        {
+            let mut cfg = OptimizationConfig::from_preset(OptimizationPreset::Balanced);
+            cfg.resize_width = Some(16);
+            cfg.output_format_policy = OutputFormatPolicy::Force(ImageFormat::Avif);
+            let res = service.optimize_bytes(&png_bytes, &cfg).unwrap();
+            assert_eq!(res.effective_format, ImageFormat::Avif);
+            assert_eq!(res.validated_output.dimensions, Dimensions::new(16, 8));
+        }
+        #[cfg(not(all(feature = "avif-encode", feature = "avif-decode")))]
+        let _ = &png_bytes;
 
         let anim = DecodedAnimation {
             width: 8,
@@ -814,5 +974,33 @@ mod tests {
             anim_res.effective_format,
             ImageFormat::Webp | ImageFormat::Gif
         ));
+    }
+
+    #[test]
+    fn test_optimize_raw_pixels_matches_optimize_bytes() {
+        let service = OptimizationService::new("0.1.0");
+        let rgb = [140u8, 80, 200].repeat(8 * 8);
+        let png_bytes = PngCodec
+            .encode(
+                &DecodedPixels::new(8, 8, PixelFormat::Rgb8, rgb.clone()),
+                &EncodeOptions::default(),
+            )
+            .unwrap()
+            .bytes;
+        let raw =
+            crate::model::RawImage::new(Dimensions::new(8, 8), crate::model::ColorType::Rgb8, rgb);
+        let mut cfg = OptimizationConfig::from_preset(OptimizationPreset::Balanced);
+        cfg.output_format_policy = OutputFormatPolicy::Force(ImageFormat::Jpeg);
+
+        let via_raw = service
+            .optimize_raw_pixels(&png_bytes, raw, ImageFormat::Png, &cfg)
+            .unwrap();
+        let via_bytes = service.optimize_bytes(&png_bytes, &cfg).unwrap();
+        assert_eq!(via_raw.effective_format, via_bytes.effective_format);
+        assert_eq!(via_raw.optimization_key, via_bytes.optimization_key);
+        assert_eq!(
+            via_raw.validated_output.bytes,
+            via_bytes.validated_output.bytes
+        );
     }
 }

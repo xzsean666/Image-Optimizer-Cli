@@ -425,9 +425,9 @@ pub(crate) fn search_best_candidate_with_limits(
 mod tests {
     use super::*;
     use crate::model::{ColorType, Dimensions};
-    use imgopt_codecs::{
-        CodecCapabilities, CodecError, CodecFormat, EncodedOutput, JpegCodec, WebpCodec,
-    };
+    #[cfg(feature = "webp")]
+    use imgopt_codecs::WebpCodec;
+    use imgopt_codecs::{CodecCapabilities, CodecError, CodecFormat, EncodedOutput, JpegCodec};
 
     struct TestCodec;
 
@@ -520,15 +520,19 @@ mod tests {
         let res_jpeg = search_best_candidate(&rgba_raw, &JpegCodec, &jpeg_opts).unwrap();
         assert_eq!(res_jpeg.selected.format, ImageFormat::Jpeg);
 
-        let gray_raw = RawImage::new(Dimensions::new(8, 8), ColorType::Grayscale8, vec![160; 64]);
-        let webp_opts = SearchOptions {
-            target_format: ImageFormat::Webp,
-            quality_target: 0.90,
-            try_lossless: true,
-            ..Default::default()
-        };
-        let res_webp = search_best_candidate(&gray_raw, &WebpCodec, &webp_opts).unwrap();
-        assert_eq!(res_webp.selected.format, ImageFormat::Webp);
+        #[cfg(feature = "webp")]
+        {
+            let gray_raw =
+                RawImage::new(Dimensions::new(8, 8), ColorType::Grayscale8, vec![160; 64]);
+            let webp_opts = SearchOptions {
+                target_format: ImageFormat::Webp,
+                quality_target: 0.90,
+                try_lossless: true,
+                ..Default::default()
+            };
+            let res_webp = search_best_candidate(&gray_raw, &WebpCodec, &webp_opts).unwrap();
+            assert_eq!(res_webp.selected.format, ImageFormat::Webp);
+        }
     }
 
     #[test]

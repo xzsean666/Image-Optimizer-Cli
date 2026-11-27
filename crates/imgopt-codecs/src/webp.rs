@@ -1,8 +1,10 @@
 use crate::decode_with_image_reader;
 use crate::interface::{
     CodecCapabilities, CodecError, CodecFormat, DecodeLimits, DecodedPixels, EncodeOptions,
-    EncodedOutput, ImageCodec, ImageMetadataChunks, MetadataPreservation, PixelFormat,
+    EncodedOutput, ImageCodec,
 };
+#[cfg(feature = "webp")]
+use crate::interface::{ImageMetadataChunks, MetadataPreservation, PixelFormat};
 
 /// Codec adapter for WebP image encoding and decoding.
 #[derive(Debug, Default, Clone, Copy)]
@@ -12,8 +14,8 @@ impl ImageCodec for WebpCodec {
     fn capabilities(&self) -> CodecCapabilities {
         CodecCapabilities {
             format: CodecFormat::Webp,
-            supports_lossless: true,
-            supports_lossy: true,
+            supports_lossless: cfg!(feature = "webp"),
+            supports_lossy: cfg!(feature = "webp"),
             supports_alpha: true,
         }
     }
@@ -35,6 +37,7 @@ impl ImageCodec for WebpCodec {
         )
     }
 
+    #[cfg(feature = "webp")]
     fn encode(
         &self,
         pixels: &DecodedPixels,
@@ -126,9 +129,21 @@ impl ImageCodec for WebpCodec {
             effective_options: options.clone(),
         })
     }
+
+    #[cfg(not(feature = "webp"))]
+    fn encode(
+        &self,
+        _pixels: &DecodedPixels,
+        _options: &EncodeOptions,
+    ) -> Result<EncodedOutput, CodecError> {
+        Err(CodecError::UnsupportedFormat(
+            "WebP encoding requires the `webp` feature".into(),
+        ))
+    }
 }
 
 /// Mux ICCP, EXIF, and XMP chunks into an extended WebP (VP8X) RIFF container.
+#[cfg(feature = "webp")]
 fn mux_webp_metadata(
     webp_bytes: &[u8],
     width: u32,
@@ -264,6 +279,7 @@ fn mux_webp_metadata(
     Ok(out)
 }
 
+#[cfg(feature = "webp")]
 fn append_riff_chunk(buf: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) -> Result<(), CodecError> {
     let len = u32::try_from(data.len()).map_err(|_| {
         CodecError::EncodeError("WebP metadata chunk exceeds 4GB RIFF chunk limit".into())
@@ -281,6 +297,7 @@ fn append_riff_chunk(buf: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) -> Result
 mod tests {
     use super::*;
 
+    #[cfg(feature = "webp")]
     #[test]
     fn test_webp_rgb_lossless_roundtrip() {
         let codec = WebpCodec;
@@ -312,6 +329,7 @@ mod tests {
         assert_eq!(decoded.height, height);
     }
 
+    #[cfg(feature = "webp")]
     #[test]
     fn test_webp_rgba_alpha_lossy() {
         let codec = WebpCodec;
@@ -344,6 +362,7 @@ mod tests {
         assert_eq!(decoded.height, height);
     }
 
+    #[cfg(feature = "webp")]
     #[test]
     fn test_webp_metadata_preservation_and_stripping() {
         let codec = WebpCodec;
@@ -383,6 +402,7 @@ mod tests {
         assert!(decoded_strip.metadata.is_empty());
     }
 
+    #[cfg(feature = "webp")]
     #[test]
     fn test_webp_opaque_rgba_with_metadata_roundtrips() {
         let codec = WebpCodec;

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::detect_format;
 use crate::error::{ErrorKind, ImgoptError, PipelineStage, Result};
+use crate::hash::{hash_bytes, Sha256Digest};
 use crate::model::{ColorType, Dimensions, ImageFormat, ImageMetadata, ImageProfile, RawImage};
 
 /// Resource constraints to protect memory and CPU usage during decode and analysis.
@@ -110,8 +111,32 @@ pub struct AnalysisResult {
     pub characteristics: ImageCharacteristics,
 }
 
+/// Lightweight inspection summary for both static and animated images.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InspectReport {
+    pub source_sha256: Sha256Digest,
+    pub format: ImageFormat,
+    pub animated: bool,
+    pub frame_count: usize,
+    pub total_duration_millis: u64,
+    pub dimensions: Dimensions,
+    pub color_type: ColorType,
+    pub byte_size: u64,
+    pub metadata: ImageMetadata,
+    pub characteristics: Option<ImageCharacteristics>,
+}
+
 /// Analyze source image bytes with resource guardrails.
 pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<AnalysisResult> {
+    analyze_image_with_decode_limits(bytes, limits, None)
+}
+
+/// Analyze source image bytes with resource guardrails and optional decoder thread cap.
+pub fn analyze_image_with_decode_limits(
+    bytes: &[u8],
+    limits: Option<&ResourceLimits>,
+    max_threads: Option<usize>,
+) -> Result<AnalysisResult> {
     let default_limits = ResourceLimits::default();
     let limits = limits.unwrap_or(&default_limits);
 
@@ -129,7 +154,8 @@ pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<An
     let format = detect_format(bytes)?;
 
     let codec = imgopt_codecs::codec_for_format(format.into());
-    let decode_limits = limits.to_decode_limits();
+    let mut decode_limits = limits.to_decode_limits();
+    decode_limits.max_threads = max_threads;
     let decoded = codec
         .decode_with_limits(bytes, &decode_limits)
         .map_err(|e| match e {
@@ -212,6 +238,77 @@ pub fn analyze_image(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<An
         profile,
         raw_image,
         characteristics,
+    })
+}
+
+/// Inspect static or animated image bytes without exposing the decoded pixel buffer.
+pub fn inspect_bytes(bytes: &[u8], limits: Option<&ResourceLimits>) -> Result<InspectReport> {
+    let default_limits = ResourceLimits::default();
+    let limits = limits.unwrap_or(&default_limits);
+
+    if (bytes.len() as u64) > limits.max_input_bytes {
+        return Err(ImgoptError::new(
+            PipelineStage::ResourceCheck,
+            ErrorKind::ResourceLimitExceeded(format!(
+                "input size {} bytes exceeds configured limit of {} bytes",
+                bytes.len(),
+                limits.max_input_bytes
+            )),
+        ));
+    }
+
+    let source_sha256 = hash_bytes(bytes);
+    let format = detect_format(bytes)?;
+    let mut decode_limits = limits.to_decode_limits();
+    if cfg!(target_arch = "wasm32") {
+        decode_limits.max_threads = Some(1);
+    }
+
+    if matches!(
+        format,
+        ImageFormat::Gif | ImageFormat::Webp | ImageFormat::Png
+    ) {
+        match imgopt_codecs::decode_animation_with_limits(bytes, format.into(), &decode_limits) {
+            Ok(Some(anim)) => {
+                let total_duration_millis =
+                    anim.frames.iter().map(|f| u64::from(f.delay_millis)).sum();
+                return Ok(InspectReport {
+                    source_sha256,
+                    format,
+                    animated: true,
+                    frame_count: anim.frames.len(),
+                    total_duration_millis,
+                    dimensions: Dimensions::new(anim.width, anim.height),
+                    color_type: ColorType::Rgba8,
+                    byte_size: bytes.len() as u64,
+                    metadata: probe_metadata_markers(bytes, format),
+                    characteristics: None,
+                });
+            }
+            Ok(None) => {}
+            Err(imgopt_codecs::CodecError::ResourceLimitExceeded(msg)) => {
+                return Err(ImgoptError::new(
+                    PipelineStage::ResourceCheck,
+                    ErrorKind::ResourceLimitExceeded(msg),
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+
+    let analysis =
+        analyze_image_with_decode_limits(bytes, Some(limits), decode_limits.max_threads)?;
+    Ok(InspectReport {
+        source_sha256,
+        format: analysis.profile.format,
+        animated: false,
+        frame_count: 1,
+        total_duration_millis: 0,
+        dimensions: analysis.profile.dimensions,
+        color_type: analysis.profile.color_type,
+        byte_size: analysis.profile.byte_size,
+        metadata: analysis.profile.metadata,
+        characteristics: Some(analysis.characteristics),
     })
 }
 
@@ -523,8 +620,10 @@ fn calculate_entropy(data: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "webp")]
+    use imgopt_codecs::WebpCodec;
     use imgopt_codecs::{
-        DecodedPixels, EncodeOptions, ImageCodec, JpegCodec, PixelFormat, PngCodec, WebpCodec,
+        DecodedPixels, EncodeOptions, ImageCodec, JpegCodec, PixelFormat, PngCodec,
     };
 
     fn make_test_jpeg() -> Vec<u8> {
@@ -549,6 +648,7 @@ mod tests {
             .bytes
     }
 
+    #[cfg(feature = "webp")]
     fn make_test_webp() -> Vec<u8> {
         let codec = WebpCodec;
         let pixels = DecodedPixels::new(4, 4, PixelFormat::Rgb8, vec![200; 48]);
@@ -572,10 +672,13 @@ mod tests {
         assert_eq!(res_png.profile.dimensions, Dimensions::new(2, 1));
         assert!(res_png.characteristics.has_transparency);
 
-        let webp_bytes = make_test_webp();
-        let res_webp = analyze_image(&webp_bytes, None).unwrap();
-        assert_eq!(res_webp.profile.format, ImageFormat::Webp);
-        assert_eq!(res_webp.profile.dimensions, Dimensions::new(4, 4));
+        #[cfg(feature = "webp")]
+        {
+            let webp_bytes = make_test_webp();
+            let res_webp = analyze_image(&webp_bytes, None).unwrap();
+            assert_eq!(res_webp.profile.format, ImageFormat::Webp);
+            assert_eq!(res_webp.profile.dimensions, Dimensions::new(4, 4));
+        }
     }
 
     #[test]
@@ -590,5 +693,43 @@ mod tests {
 
         let err = analyze_image(&jpeg_bytes, Some(&tight_limits)).unwrap_err();
         assert_eq!(err.stage, PipelineStage::ResourceCheck);
+    }
+
+    #[test]
+    fn test_inspect_bytes_static_and_animated() {
+        let jpeg_bytes = make_test_jpeg();
+        let static_report = inspect_bytes(&jpeg_bytes, None).unwrap();
+        assert_eq!(static_report.format, ImageFormat::Jpeg);
+        assert!(!static_report.animated);
+        assert_eq!(static_report.frame_count, 1);
+        assert_eq!(static_report.dimensions, Dimensions::new(4, 4));
+        assert!(static_report.characteristics.is_some());
+
+        let anim = imgopt_codecs::DecodedAnimation {
+            width: 4,
+            height: 4,
+            frames: vec![
+                imgopt_codecs::AnimationFrame {
+                    width: 4,
+                    height: 4,
+                    rgba: [255, 0, 0, 255].repeat(16),
+                    delay_millis: 40,
+                },
+                imgopt_codecs::AnimationFrame {
+                    width: 4,
+                    height: 4,
+                    rgba: [0, 255, 0, 255].repeat(16),
+                    delay_millis: 60,
+                },
+            ],
+        };
+        let gif_bytes =
+            imgopt_codecs::encode_animated_gif(&anim, &EncodeOptions::default()).unwrap();
+        let anim_report = inspect_bytes(&gif_bytes, None).unwrap();
+        assert_eq!(anim_report.format, ImageFormat::Gif);
+        assert!(anim_report.animated);
+        assert_eq!(anim_report.frame_count, 2);
+        assert_eq!(anim_report.total_duration_millis, 100);
+        assert_eq!(anim_report.dimensions, Dimensions::new(4, 4));
     }
 }

@@ -15,7 +15,8 @@ pub mod sync;
 pub mod validation;
 
 pub use analyzer::{
-    analyze_image, read_file_bounded, AnalysisResult, ImageCharacteristics, ResourceLimits,
+    analyze_image, analyze_image_with_decode_limits, inspect_bytes, read_file_bounded,
+    AnalysisResult, ImageCharacteristics, InspectReport, ResourceLimits,
 };
 pub use benchmark::{
     run_benchmark, run_benchmark_with_concurrency, run_benchmark_with_options, BenchmarkCaseResult,

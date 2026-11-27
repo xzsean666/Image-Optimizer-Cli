@@ -128,39 +128,46 @@ pub fn resize_pixels(
 
 /// Convert non-sRGB ICC-profiled pixels into sRGB via `qcms` so stripping ICC metadata
 /// does not cause wide-gamut color shifts in browsers.
-pub fn convert_icc_to_srgb(pixels: &DecodedPixels) -> DecodedPixels {
+/// Also returns whether the image pixels or ICC profile were changed.
+pub fn convert_icc_to_srgb_with_status(pixels: &DecodedPixels) -> (DecodedPixels, bool) {
     let Some(ref icc_bytes) = pixels.metadata.icc_profile else {
-        return pixels.clone();
+        return (pixels.clone(), false);
     };
     if icc_bytes.is_empty() {
-        return pixels.clone();
+        return (pixels.clone(), false);
     }
 
     let Some(src_profile) = Profile::new_from_slice(icc_bytes, false) else {
-        return pixels.clone();
+        return (pixels.clone(), false);
     };
     if src_profile.is_sRGB() {
         let mut out = pixels.clone();
         out.metadata.icc_profile = None;
-        return out;
+        return (out, true);
     }
 
     let dst_profile = Profile::new_sRGB();
     let data_type = match pixels.pixel_format {
         PixelFormat::Rgb8 => DataType::RGB8,
         PixelFormat::Rgba8 => DataType::RGBA8,
-        _ => return pixels.clone(),
+        _ => return (pixels.clone(), false),
     };
 
     let Some(transform) = Transform::new(&src_profile, &dst_profile, data_type, Intent::Perceptual)
     else {
-        return pixels.clone();
+        return (pixels.clone(), false);
     };
 
     let mut out = pixels.clone();
     transform.apply(&mut out.data);
     out.metadata.icc_profile = None;
-    out
+    (out, true)
+}
+
+/// Convert non-sRGB ICC-profiled pixels into sRGB via `qcms` so stripping ICC metadata
+/// does not cause wide-gamut color shifts in browsers.
+pub fn convert_icc_to_srgb(pixels: &DecodedPixels) -> DecodedPixels {
+    convert_icc_to_srgb_with_status(pixels).0
 }
 
 /// Decode an animated GIF, animated WebP, or APNG into RGBA8 frames with streaming per-frame memory bounds.
@@ -259,6 +266,7 @@ fn collect_animation_frames<'a>(
 }
 
 /// Encode an animation sequence as animated WebP using `libwebp` (`webp::AnimEncoder`).
+#[cfg(feature = "webp")]
 pub fn encode_animated_webp(
     anim: &DecodedAnimation,
     options: &EncodeOptions,
@@ -313,6 +321,16 @@ pub fn encode_animated_webp(
         ));
     }
     Ok(mem.to_vec())
+}
+
+#[cfg(not(feature = "webp"))]
+pub fn encode_animated_webp(
+    _anim: &DecodedAnimation,
+    _options: &EncodeOptions,
+) -> Result<Vec<u8>, CodecError> {
+    Err(CodecError::UnsupportedFormat(
+        "animated WebP encoding requires the `webp` feature".into(),
+    ))
 }
 
 /// Encode an animation sequence as animated GIF.
@@ -415,12 +433,18 @@ mod tests {
                 .unwrap();
         assert_eq!(dec_gif.frames.len(), 2);
 
-        let webp_bytes = encode_animated_webp(&dec_gif, &opts).unwrap();
-        let dec_webp =
-            decode_animation_with_limits(&webp_bytes, CodecFormat::Webp, &DecodeLimits::default())
-                .unwrap()
-                .unwrap();
-        assert_eq!(dec_webp.frames.len(), 2);
+        #[cfg(feature = "webp")]
+        {
+            let webp_bytes = encode_animated_webp(&dec_gif, &opts).unwrap();
+            let dec_webp = decode_animation_with_limits(
+                &webp_bytes,
+                CodecFormat::Webp,
+                &DecodeLimits::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(dec_webp.frames.len(), 2);
+        }
     }
 
     #[test]

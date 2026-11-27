@@ -7,14 +7,19 @@ description = "Rust image optimization engine (JPEG, PNG, WebP, AVIF, GIF) with 
 repository = "https://github.com/xzsean666/Image-Optimizer-Cli"
 
 [features]
-default = []
+default = ["parallel", "webp", "avif"]
+parallel = ["imgopt-core/parallel", "imgopt-codecs/parallel"]
+webp = ["imgopt-core/webp", "imgopt-codecs/webp"]
+avif = ["avif-encode", "avif-decode"]
+avif-encode = ["imgopt-core/avif-encode", "imgopt-codecs/avif-encode"]
+avif-decode = ["imgopt-core/avif-decode", "imgopt-codecs/avif-decode"]
 manifest = ["dep:imgopt-manifest"]
 storage = ["dep:imgopt-storage"]
 full = ["manifest", "storage"]
 
 [dependencies]
-imgopt-codecs = { path = "../imgopt-codecs" }
-imgopt-core = { path = "../imgopt-core" }
+imgopt-codecs = { path = "../imgopt-codecs", default-features = false }
+imgopt-core = { path = "../imgopt-core", default-features = false }
 imgopt-manifest = { path = "../imgopt-manifest", optional = true }
 imgopt-quality = { path = "../imgopt-quality" }
 imgopt-storage = { path = "../imgopt-storage", optional = true }

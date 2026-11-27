@@ -21,10 +21,51 @@ pub use interface::{
 pub use jpeg::JpegCodec;
 pub use png::PngCodec;
 pub use transform::{
-    compute_target_dimensions, convert_icc_to_srgb, decode_animation_with_limits,
-    encode_animated_gif, encode_animated_webp, resize_pixels, ResizeMode,
+    compute_target_dimensions, convert_icc_to_srgb, convert_icc_to_srgb_with_status,
+    decode_animation_with_limits, encode_animated_gif, encode_animated_webp, resize_pixels,
+    ResizeMode,
 };
 pub use webp::WebpCodec;
+
+/// Probe image `(width, height)` from container headers without allocating pixel buffers.
+pub fn probe_dimensions(input_bytes: &[u8], format: CodecFormat) -> Result<(u32, u32), CodecError> {
+    if input_bytes.is_empty() {
+        return Err(CodecError::DecodeError("empty input bytes".into()));
+    }
+    match format {
+        CodecFormat::Jpeg | CodecFormat::Png | CodecFormat::Webp | CodecFormat::Gif => {
+            let img_fmt = match format {
+                CodecFormat::Jpeg => image::ImageFormat::Jpeg,
+                CodecFormat::Png => image::ImageFormat::Png,
+                CodecFormat::Webp => image::ImageFormat::WebP,
+                CodecFormat::Gif => image::ImageFormat::Gif,
+                CodecFormat::Avif => unreachable!(),
+            };
+            let decoder = ImageReader::with_format(Cursor::new(input_bytes), img_fmt)
+                .into_decoder()
+                .map_err(|e| map_image_error(format, e))?;
+            Ok(decoder.dimensions())
+        }
+        CodecFormat::Avif => {
+            #[cfg(feature = "avif-decode")]
+            {
+                let avif = avif_parse::read_avif(&mut Cursor::new(input_bytes)).map_err(|e| {
+                    CodecError::DecodeError(format!("failed to parse AVIF container: {e}"))
+                })?;
+                let meta = avif.primary_item_metadata().map_err(|e| {
+                    CodecError::DecodeError(format!("failed to parse AVIF sequence header: {e}"))
+                })?;
+                Ok((meta.max_frame_width.get(), meta.max_frame_height.get()))
+            }
+            #[cfg(not(feature = "avif-decode"))]
+            {
+                Err(CodecError::UnsupportedFormat(
+                    "AVIF header probing requires the `avif-decode` feature".into(),
+                ))
+            }
+        }
+    }
+}
 
 /// Helper function to get default codec for a given format.
 pub fn codec_for_format(format: CodecFormat) -> Box<dyn ImageCodec> {
@@ -220,6 +261,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_probe_dimensions_matches_decoded() {
+        let pixels = DecodedPixels::new(12, 7, PixelFormat::Rgb8, vec![100; 12 * 7 * 3]);
+        let png = PngCodec.encode(&pixels, &EncodeOptions::default()).unwrap();
+        assert_eq!(
+            probe_dimensions(&png.bytes, CodecFormat::Png).unwrap(),
+            (12, 7)
+        );
+        let jpg = JpegCodec
+            .encode(&pixels, &EncodeOptions::default())
+            .unwrap();
+        assert_eq!(
+            probe_dimensions(&jpg.bytes, CodecFormat::Jpeg).unwrap(),
+            (12, 7)
+        );
+    }
+
+    #[cfg(feature = "webp")]
     #[test]
     fn test_animated_webp_rejected_explicitly() {
         let mut config = ::webp::WebPConfig::new().unwrap();

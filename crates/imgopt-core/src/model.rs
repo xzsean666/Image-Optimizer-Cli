@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{ErrorKind, ImgoptError, PipelineStage, Result};
@@ -45,10 +46,13 @@ pub fn compute_byte_savings(original: u64, optimized: u64) -> (i64, f64) {
 
 /// Format current system UTC time as RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
 pub fn utc_now_rfc3339() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    #[cfg(target_arch = "wasm32")]
+    let secs = 0u64;
     let (y, m, d, hour, minute, second) = unix_to_utc_components(secs);
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
